@@ -22,8 +22,6 @@ import type { AgentRow } from './scene/cast.ts';
 import { fieldsOf } from './scene/label.ts';
 import { workspaceLabel } from './workspace.ts';
 import { decodeWorktree, sharesCheckout, worktreeText } from './worktree.ts';
-import { TracesPanel } from './TracesPanel.tsx';
-import type { TurnTrace } from './traces.ts';
 
 function providerLabel(provider: string): string {
   return (HIRE_ENGINES as Readonly<Record<string, string>>)[provider] ?? provider;
@@ -42,7 +40,7 @@ const BASELINE_LINES: Readonly<Record<Baseline | 'absent', string>> = Object.fre
 
 export function AgentDetail({
   row, selection = null, streamState = null, control = null, retire = null, terminal = null, enable = null, answer = null, goal: goalForm = null,
-  output = null, messages = null, chat = null, terminalDetails = null, git = null, memory = null, traces = [], tab = 'overview', onTabChange = () => {}, live = false,
+  output = null, messages = null, chat = null, terminalDetails = null, git = null, memory = null, tab = 'overview', onTabChange = () => {}, live = false,
 }: {
   readonly row: AgentRow;
   readonly selection?: ReactNode;
@@ -61,7 +59,6 @@ export function AgentDetail({
   readonly terminalDetails?: ReactNode;
   readonly git?: ReactNode;
   readonly memory?: ReactNode;
-  readonly traces?: readonly TurnTrace[];
   readonly tab?: DetailTab;
   readonly onTabChange?: (tab: DetailTab) => void;
   readonly live?: boolean;
@@ -113,7 +110,6 @@ export function AgentDetail({
     { id: 'terminal', label: 'Terminal', content: terminalDetails },
     { id: 'git', label: 'Git', content: git },
     { id: 'memory', label: 'Memory', content: memory },
-    { id: 'traces', label: 'Traces', content: traces.length === 0 ? null : <TracesPanel traces={traces} /> },
     { id: 'messages', label: 'Messages', content: messages },
   ];
   const available = panels.filter((panel) => panel.content !== null);
