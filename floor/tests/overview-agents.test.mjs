@@ -166,14 +166,15 @@ test('the header keeps enabled controls beside the tabbed agent facts', async ()
   });
 });
 
-test('a turn without assistant text hides Output while the header retains its status', async () => {
+test('a turn without assistant text offers no output toggle while the header retains its status', async () => {
   await withViews(({ drawer: center }) => {
     const output = { ...live.output, targetId: GRACE, status: 'live', chunks: [] };
     assert.match(center({ ...live, output }, grace, GRACE), /data-status="running"/);
-    assert.doesNotMatch(center({ ...live, output }, grace, GRACE), /role="tab"[^>]*>Output<\/button>/);
-    assert.doesNotMatch(center({ ...live, output: { ...output, status: 'ended' } }, grace, GRACE),
-      /role="tab"[^>]*>Output<\/button>/);
-    assert.doesNotMatch(center({ ...live, stale: true, output }, grace, GRACE), /role="tab"[^>]*>Output<\/button>/);
+    assert.doesNotMatch(center({ ...live, output }, grace, GRACE), /Show full output/);
+    assert.doesNotMatch(center({ ...live, output: { ...output, status: 'ended' } }, grace, GRACE), /Show full output/);
+    assert.doesNotMatch(center({ ...live, stale: true, output }, grace, GRACE), /Show full output/);
+    assert.match(center({ ...live, output: { ...output, status: 'gap' } }, grace, GRACE), /Show full output/,
+      'an incomplete stream still has its output to open');
   });
 });
 

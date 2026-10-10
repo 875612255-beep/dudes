@@ -1040,8 +1040,7 @@ test('the only activators are named selection, retry, view, Hire, answer, Chat, 
     ...Array(3).fill(ARCHIVED_AGENTS),
     ...Array(5).fill('src/renderer/Control.tsx'),
     'src/renderer/DoneNotices.tsx',
-    'src/renderer/LiveWork.tsx',
-    'src/renderer/LiveWork.tsx',
+    ...Array(3).fill('src/renderer/LiveWork.tsx'),
     'src/renderer/BoardNotes.tsx',
     'src/renderer/BoardPanel.tsx',
     ...Array(6).fill('src/renderer/OfficeCanvas.tsx'),
@@ -1141,6 +1140,7 @@ test('the only activators are named selection, retry, view, Hire, answer, Chat, 
   const work = await readFile(resolve(source, 'renderer/LiveWork.tsx'), 'utf8');
   assert.match(work, /onClick=\{\(\) => selectOutputAgent\(output\.targetId, true\)\}/);
   assert.match(work, /onClick=\{onClear\}/);
+  assert.match(work, /onClick=\{\(\) => onToggle\(!open\)\}/);
 
   // The Hire form's activators, each named: sections, Back, Next, the one
   // Hire, Check again for a missing engine, Check status on the same attempt,
