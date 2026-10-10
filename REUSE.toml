@@ -1,0 +1,43 @@
+# REUSE 3.3 (https://reuse.software/spec-3.3/): licensing is declared here instead of per-file SPDX
+# headers. Licence texts live in LICENSES/ (REUSE) and at the root as LICENSE-MIT / LICENSE-APACHE (Rust
+# convention). If third-party code with a different copyright holder is ever vendored, it gets its own
+# [[annotations]] table with precedence = "override".
+version = 1
+
+[[annotations]]
+path = ["**"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 The Dudes contributors"
+SPDX-License-Identifier = "MIT OR Apache-2.0"
+
+[[annotations]]
+path = ["CODE_OF_CONDUCT.md"]
+precedence = "override"
+SPDX-FileCopyrightText = "Organization for Ethical Source (Contributor Covenant 3.0)"
+SPDX-License-Identifier = "CC-BY-SA-4.0"
+
+[[annotations]]
+path = ["vendor/libproc/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2010 3scale networks S.L."
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = [
+  "vendor/libproc/doc/MacosVersions.md",
+  "vendor/libproc/src/lib.rs",
+  "vendor/libproc/src/libproc/proc_pid.rs",
+  "vendor/libproc/tests/pidversion.rs",
+]
+precedence = "override"
+SPDX-FileCopyrightText = [
+  "2010 3scale networks S.L.",
+  "2026 The Dudes contributors",
+]
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["vendor/libproc/PROVENANCE.md"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 The Dudes contributors"
+SPDX-License-Identifier = "MIT"

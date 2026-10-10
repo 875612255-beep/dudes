@@ -1,0 +1,6 @@
+# The shim launches no process; its process-level test carries the one item-scoped exception.
+disallowed-types = ["std::process::Command"]
+# Workspace keys (see /clippy.toml).
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+avoid-breaking-exported-api = false

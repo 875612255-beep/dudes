@@ -1,0 +1,9 @@
+[alias]
+# `cargo xtask <command>` — repo automation (layering, schemas, ...). See xtask/src/main.rs.
+# `--locked` here (and on the `cargo metadata` call inside xtask) so CI never re-resolves Cargo.lock.
+xtask = "run --locked --quiet --package xtask --"
+
+[env]
+# The supported macOS distribution starts at 12.0. An explicit caller value is preserved and the
+# dudes-host build script refuses values below this floor before an artefact is produced.
+MACOSX_DEPLOYMENT_TARGET = { value = "12.0", force = false }

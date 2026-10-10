@@ -1,0 +1,35 @@
+{
+  "hashed_valid": [
+    "assets/index-01234567.js",
+    "assets/index-Abc_1234.js",
+    "assets/index-Abcd-1234.js",
+    "assets/prefix-x.y-12345678.js",
+    "assets/third-party-licenses-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.json"
+  ],
+  "hashed_invalid": [
+    "assets/application.js",
+    "assets/12345678.js",
+    "assets/app.longfilename.js",
+    "assets/app-1234567.js",
+    "assets/app.12345678.js",
+    "other/app-01234567.js"
+  ],
+  "served_valid": [
+    "index.html",
+    "assets/app-01234567.js",
+    "assets/app-01234567.css",
+    "assets/app-01234567.json",
+    "assets/app-01234567.png",
+    "assets/app-01234567.svg",
+    "assets/app-01234567.woff2"
+  ],
+  "served_invalid": [
+    "assets/app-01234567.zip",
+    "assets/app-01234567.tar.gz",
+    "assets/app-01234567.wasm",
+    "assets/app-01234567.node",
+    "assets/app-01234567.html",
+    "assets/app-01234567",
+    "assets/app-01234567.exe"
+  ]
+}

@@ -1,0 +1,11 @@
+# Invariant 5: the loop is pure. Clippy reads exactly one configuration file (this one replaces
+# the workspace's for this crate), so the workspace keys are repeated below; keep them in step.
+# The lint also covers `tests/`, which may read the source tree, so the file system is left to
+# the `tests/purity.rs` scan of `src/`.
+disallowed-methods = ["std::time::Instant::now", "std::time::SystemTime::now", "std::env::var"]
+disallowed-types = ["std::net::TcpStream", "std::process::Command"]
+
+# Workspace keys (see /clippy.toml).
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+avoid-breaking-exported-api = false

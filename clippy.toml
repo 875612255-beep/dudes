@@ -1,0 +1,4 @@
+# `msrv` is read from `rust-version` in Cargo.toml; do not duplicate it here.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+avoid-breaking-exported-api = false

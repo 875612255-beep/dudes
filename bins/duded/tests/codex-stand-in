@@ -1,0 +1,38 @@
+#!/bin/sh
+# A Codex stand-in for the daemon tests: `codex exec --json` wire lines with no account behind them.
+#
+# Each run appends a `run` line, its CODEX_HOME and then its argv, one element per line, to
+# $DUDES_CODEX_STAND_IN_LOG. A new thread is indexed in $CODEX_HOME/stand-in-threads, and
+# `exec resume <id>` succeeds only for an id that file holds, because the vendor resumes a thread
+# only in the home that indexed it.
+set -eu
+
+thread=0190f6d2-6b1a-7c3e-9f00-000000000001
+input=10
+output=2
+{
+    printf 'run\nCODEX_HOME=%s\n' "${CODEX_HOME-}"
+    printf '%s\n' "$@"
+} >>"$DUDES_CODEX_STAND_IN_LOG"
+
+[ "$1" = exec ]
+shift
+if [ "${1-}" = --add-dir ]; then
+    shift 2
+fi
+if [ "${1-}" = resume ]; then
+    thread=$2
+    if ! grep -qx "$thread" "$CODEX_HOME/stand-in-threads" 2>/dev/null; then
+        printf '{"type":"error","message":"no thread %s in this home"}\n' "$thread"
+        exit 1
+    fi
+    input=25
+    output=5
+else
+    printf '%s\n' "$thread" >>"$CODEX_HOME/stand-in-threads"
+fi
+
+printf '{"type":"thread.started","thread_id":"%s"}\n' "$thread"
+printf '{"type":"turn.started"}\n'
+printf '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"stand-in reply"}}\n'
+printf '{"type":"turn.completed","usage":{"input_tokens":%s,"cached_input_tokens":0,"output_tokens":%s}}\n' "$input" "$output"

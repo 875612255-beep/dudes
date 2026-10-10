@@ -1,0 +1,50 @@
+[package]
+name = "dudes-win"
+description = "Windows DACL and filesystem operations for Dudes, exposed through safe functions."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    # `peek_named_pipe` calls `PeekNamedPipe` to see whether a pipe's client has gone.
+    "Win32_System_Pipes",
+    # `current_user_sid` reads this process's token through `GetCurrentProcess` and
+    # `OpenProcessToken`. The source guard checks the three job/termination spellings.
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+# The lint table copies `dudes-host`'s unsafe grant, with exactly the same three lint deltas, and
+# `tests/unsafe_grant.rs` pins the
+# grant to `src/windows.rs` and measures its size.
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+undocumented_unsafe_blocks = "deny"
+dbg_macro = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+todo = "warn"
+unimplemented = "warn"

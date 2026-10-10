@@ -1,0 +1,33 @@
+[package]
+name = "xtask"
+description = "Repository automation for Dudes: `cargo xtask <command>`"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+# The journal and the projection store, for `xtask journal` and `xtask export`. The gate's offline
+# readers must use the shipped types: a checker with its own copy of a record shape or a fold stays
+# green after the daemon drifts away from it. Neither crate reaches anything `cargo xtask layering`
+# forbids this member — no async runtime, no TLS, no HTTP client.
+dudes-journal.workspace = true
+dudes-proto.workspace = true
+dudes-types = { workspace = true, features = ["std"] }
+proc-macro2.workspace = true
+serde_json.workspace = true
+# The release archive's `SHA256SUMS` line for `cargo xtask dist`.
+sha2.workspace = true
+syn.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

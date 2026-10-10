@@ -1,0 +1,74 @@
+[package]
+name = "dudes-rpc"
+description = "The Dudes control transport: newline-delimited JSON-RPC 2.0 over a Unix socket, with one authorisation seam on the dispatch path. Synchronous; links no async runtime."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+# `testing` — the fakes and the loopback harness in `src/testing.rs`, and nothing else. There is no
+# `default` table on purpose: the absence of one is what makes "off unless asked for" the property
+# rather than a line somebody can edit. `AdmitAll` is an `Authorizer` that admits every method, so a
+# daemon that links this crate must not be able to reach it by linking; the feature is what makes
+# `cargo build -p dudes-rpc` unable to compile it at all.
+#
+# It enables no dependency, which is why it does not disturb the graph `cargo xtask layering` walks:
+# that gate reads `cargo metadata --all-features`, and a feature with an empty edge list adds no
+# edge at any feature set. Keep it empty.
+#
+# `tests/no_default_fakes.rs` is the guard, and it fails on a `default` table that names this
+# feature and on a non-dev dependency that turns it on.
+[features]
+testing = []
+
+[dependencies]
+base64.workspace = true
+blake3.workspace = true
+dudes-proto.workspace = true
+dudes-types = { workspace = true, features = ["std"] }
+serde = { workspace = true, features = ["std"] }
+serde_json.workspace = true
+thiserror = { workspace = true, features = ["std"] }
+tracing.workspace = true
+
+# Peer credentials. Unix-only, and deliberately not optional: a build that reads no peer
+# credentials would satisfy the type but answer `None` for every field, which is the shape a
+# default-deny policy must never be handed silently.
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# The credential writer atomically creates its file with the owner-plus-DACL descriptor supplied by
+# the DACL/filesystem-only leaf. The edge remains Windows-only.
+dudes-win.workspace = true
+interprocess.workspace = true
+widestring.workspace = true
+
+# The self-reference is how this crate's own `tests/` reach `testing`. An integration test is a
+# separate crate that depends on this one, so it gets the default feature set like any other
+# dependent and cannot see a gated module without asking; naming the package here is the one way to
+# ask. Cargo permits the cycle because it runs through `[dev-dependencies]`, and a path dependency
+# with no version is stripped on publish.
+#
+# **A dev-dependency, and it has to stay one.** Resolver 3 does not unify a dev-dependency's
+# features into a build that needs no dev-dependencies, so this line is invisible to
+# `cargo build`/`cargo check` without `--all-targets` and to anything that links this crate. Moved
+# to `[dependencies]` it would turn the feature on for every dependent in the workspace, which is
+# the whole defect back; `tests/no_default_fakes.rs` fails if it moves.
+#
+# **Declared `workspace = true`, not `path = "."`.** `cargo deny`'s `[bans.workspace-dependencies]`
+# refuses a crate whose declarations do not *all* go through the shared workspace dependency, and
+# that check only bites once a second member depends on this crate — which `bins/duded` is. The
+# workspace entry is a path dependency on this same directory, so the two forms resolve identically;
+# only one of them keeps the version declared in one place.
+[dev-dependencies]
+dudes-journal.workspace = true
+dudes-rpc = { workspace = true, features = ["testing"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true

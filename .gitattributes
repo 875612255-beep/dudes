@@ -1,0 +1,4 @@
+# Text files are LF in the repository and LF in the working tree on every
+# platform. Without this, a Windows checkout delivers CRLF and any test whose
+# needle spans a line break silently passes on two OS legs and fails on one.
+* text=auto eol=lf

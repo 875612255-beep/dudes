@@ -1,0 +1,130 @@
+#!/bin/sh
+# The stand-in agent: a coding-agent CLI's wire behaviour with no account behind it.
+#
+# The daemon launches a managed turn by name — the program is resolved on the daemon's PATH — so
+# putting this directory first on PATH is the whole of the substitution. Nothing in the daemon is
+# patched or mocked for the gate, and its operator file sets only the per-turn reserve that any
+# hire with a dollar ceiling needs.
+#
+# It does five things, in this order:
+#
+#   1. announces a session, as the vendor's `system/init` line does, echoing the id the daemon
+#      minted and passed as `--session-id` (or `--resume` on a resumed turn);
+#   2. writes its own pid where the transcript can see it, and waits to be released — that hold is
+#      what lets an arm count live children at a moment it chooses instead of racing the child;
+#   3. appends that announcement to a **session transcript** of its own, one file per session id;
+#   4. does the goal's work on the run the arm asks for, and not before, so the predicate is
+#      observed *false* first and the loop has to take another turn;
+#   5. reports a `result` line for the session it announced, with the session's running cost,
+#      and exits 0.
+#
+# Step 4 is what makes arm 1 mean anything. A stand-in that did the work on its first run would
+# reach `Done` after one turn and the transcript could not tell that from a daemon that calls every
+# goal done on sight.
+#
+# Step 3 is what makes the post-`Spawn` arm mean anything. A real coding-agent CLI keeps one
+# transcript file per session and **appends** to it when that session is resumed, so two turns on
+# one session share a file and two sessions never do. That is the entire property the post-`Spawn`
+# arm measures — a crash that leaves two children must leave two files, not one with both in it —
+# so the stand-in has the same shape: `$DUDES_EXAMPLE_WORK/transcripts/<session>.jsonl`, one line
+# per event, each naming the process that wrote it.
+#
+# Configuration arrives in the environment, which is where a managed child's environment comes
+# from: the daemon starts one from its own and the adapter narrows it.
+#
+#   DUDES_EXAMPLE_WORK          the directory this shares with the arm running it (required)
+#   DUDES_EXAMPLE_MARK_ON_RUN   the run number that does the work (default 1)
+#   DUDES_EXAMPLE_HOLD_SECONDS  how long to wait for a release before giving up (default 120)
+set -u
+
+work=${DUDES_EXAMPLE_WORK:-}
+if [ -z "$work" ] || [ ! -d "$work" ]; then
+	echo "stand-in: DUDES_EXAMPLE_WORK must name an existing directory" >&2
+	exit 64
+fi
+mark_on=${DUDES_EXAMPLE_MARK_ON_RUN:-1}
+hold_seconds=${DUDES_EXAMPLE_HOLD_SECONDS:-120}
+
+# --- the session the daemon named ------------------------------------------------------------
+# Read off the argv rather than invented: a `result` line naming a session the turn never
+# announced is not that turn's result, and the daemon is right to ignore it.
+session=""
+# Which flag carried it, kept because it is the difference between a first session and a resumed
+# one and the transcript is the place that difference shows.
+flag=""
+previous=""
+for argument in "$@"; do
+	case $previous in
+	--session-id | --resume)
+		session=$argument
+		flag=$previous
+		;;
+	esac
+	previous=$argument
+done
+if [ -z "$session" ]; then
+	echo "stand-in: no --session-id or --resume in the argv" >&2
+	exit 64
+fi
+
+printf '{"type":"system","subtype":"init","session_id":"%s","tools":[]}\n' "$session"
+
+# --- which run this is -------------------------------------------------------------------------
+# One child at a time is the daemon's own rule for a managed agent, so counting the marks the
+# earlier runs left is enough and needs no lock.
+run=1
+while [ -e "$work/started.$run" ]; do
+	run=$((run + 1))
+done
+echo "$$" >"$work/started.$run"
+
+# --- the session transcript ---------------------------------------------------------------------
+# Appended, never truncated: a resumed session continues the file it already has, which is what
+# makes "two children in one session file" a thing this harness can represent at all. Opened once
+# per line so two children writing at the same time interleave the way the real ones do.
+transcripts="$work/transcripts"
+mkdir -p "$transcripts" || exit 70
+transcript="$transcripts/$session.jsonl"
+printf '{"type":"init","session_id":"%s","launched_with":"%s","pid":%s,"run":%s}\n' \
+	"$session" "$flag" "$$" "$run" >>"$transcript"
+
+# --- the hold ----------------------------------------------------------------------------------
+release="$work/release.$run"
+waited=0
+limit=$((hold_seconds * 10))
+while [ ! -e "$release" ]; do
+	waited=$((waited + 1))
+	if [ "$waited" -gt "$limit" ]; then
+		echo "stand-in: run $run was never released; expected $release" >&2
+		exit 70
+	fi
+	sleep 0.1
+done
+
+# --- the work ----------------------------------------------------------------------------------
+if [ "$run" -ge "$mark_on" ]; then
+	: >"$work/done"
+fi
+
+# --- the transcript's last line, written before the pipe is touched ------------------------------
+# The ordering is load-bearing, not tidiness. A child that outlives the daemon that launched it is
+# writing to a pipe whose only reader has died, so the `printf` below takes `SIGPIPE` and this
+# process ends there — which is exactly what the post-`Spawn` arm arranges on purpose. The
+# transcript must not depend on a write that an arm makes fail.
+printf '{"type":"result","session_id":"%s","pid":%s,"run":%s}\n' \
+	"$session" "$$" "$run" >>"$transcript"
+
+# --- the result the adapter reads --------------------------------------------------------------
+# `subtype: success`, not an error, `terminal_reason: completed`, exit 0 — the four signals the
+# adapter requires to agree before it calls a turn completed. Each run costs one cent, 10 input
+# and 20 output tokens, and the line reports the session's running total, as a real CLI does on a
+# resumed turn, so the daemon charges each run what it added. The budget projections charge it,
+# so a run that took more turns than the arm expects would show up as spend rather than as
+# nothing.
+runs=$(grep -c '"type":"init"' "$transcript")
+printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed",'
+printf '"session_id":"%s","result":"stand-in run %s","total_cost_usd":%d.%02d,' \
+	"$session" "$run" $((runs / 100)) $((runs % 100))
+printf '"modelUsage":{"stand-in":{"inputTokens":%d,"outputTokens":%d,' $((runs * 10)) $((runs * 20))
+printf '"cacheReadInputTokens":0,"cacheCreationInputTokens":0}}}\n'
+exit 0

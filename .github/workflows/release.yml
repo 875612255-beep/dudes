@@ -1,0 +1,217 @@
+# Release — builds the install archives for every target `install.sh` supports, smoke-tests each
+# one by installing it, and on a `v*` tag publishes them with one SHA256SUMS as a GitHub Release.
+#
+#   floor ─▶ build {6 targets} ─▶ collect ─▶ publish (tag only)
+#
+# A manual run (`workflow_dispatch`) does everything except publish. Action refs are pinned to
+# commit SHAs with the tag in the comment, as in ci.yml. Every cargo invocation is `--locked`.
+# Windows has no installer yet, so it has no archive.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  floor:
+    name: floor
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Tag matches the workspace version
+        if: github.ref_type == 'tag'
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(sed -nE '/^\[workspace\.package\]/,/^\[/ s/^version *= *"([^"]+)".*/\1/p' Cargo.toml)
+          test -n "$version" || { echo "Cargo.toml has no workspace version" >&2; exit 1; }
+          test "$TAG" = "v$version" || { echo "tag $TAG is not v$version, the workspace version" >&2; exit 1; }
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24.21.0"
+          package-manager-cache: false
+      # The Floor build reads the daemon version through `cargo metadata`.
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+      - name: Verify runtime versions
+        run: |
+          test "$(node --version)" = "v24.21.0"
+          test "$(npm --version)" = "11.19.0"
+      - name: Build the Floor
+        working-directory: floor
+        run: |
+          npm ci --ignore-scripts
+          npm run build
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: floor-dist
+          path: floor/dist
+          if-no-files-found: error
+          retention-days: 7
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: floor
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, os: macos-14, smoke: native }
+          - { target: x86_64-apple-darwin, os: macos-15-intel, smoke: native }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm, smoke: unpack }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-24.04, smoke: unpack }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, smoke: alpine }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-24.04, smoke: alpine }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install
+          rustup target add "$TARGET"
+      # blake3 assembles its SIMD sources with a C compiler, which a musl target needs as musl-gcc.
+      - name: Install the musl C compiler
+        if: endsWith(matrix.target, '-musl')
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          echo "CC_$(echo "$TARGET" | tr - _)=musl-gcc" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: floor-dist
+          path: floor/dist
+      - name: Build the archive
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo xtask dist --target "$TARGET"
+      - name: Smoke test, installed natively on this runner
+        if: matrix.smoke == 'native'
+        run: |
+          prefix="$RUNNER_TEMP/prefix"
+          sh install.sh --from target/dist --prefix "$prefix"
+          "$prefix/bin/dudes" --version
+          "$prefix/bin/duded" --version
+          "$prefix/bin/duded" --check-floor "$prefix/share/dudes/floor"
+          "$prefix/bin/dudes" --help
+      # install.sh installs the static musl archive on every Linux host, so the glibc archive is
+      # unpacked and run in place instead.
+      - name: Smoke test, unpacked and run in place on this runner
+        if: matrix.smoke == 'unpack'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir "$RUNNER_TEMP/unpacked"
+          tar -xzf target/dist/dudes-*-"$TARGET".tar.gz -C "$RUNNER_TEMP/unpacked"
+          release=$(echo "$RUNNER_TEMP"/unpacked/dudes-*-"$TARGET")
+          "$release/dudes" --version
+          "$release/duded" --version
+          "$release/duded" --check-floor "$release/floor"
+          "$release/dudes" --help
+      # The musl archive is the one install.sh chooses on Linux. It is installed in an Alpine
+      # container of this runner's architecture, a host with no glibc at all.
+      - name: Smoke test, installed in an Alpine (musl) container
+        if: matrix.smoke == 'alpine'
+        run: |
+          docker run --rm -v "$PWD/target/dist:/dist:ro" -v "$PWD/install.sh:/install.sh:ro" alpine:3.22 sh -c '
+            set -eu
+            sh /install.sh --from /dist --prefix /tmp/prefix
+            /tmp/prefix/bin/dudes --version
+            /tmp/prefix/bin/duded --version
+            /tmp/prefix/bin/duded --check-floor /tmp/prefix/share/dudes/floor
+            /tmp/prefix/bin/dudes --help
+          '
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: archive-${{ matrix.target }}
+          path: target/dist/dudes-*-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  collect:
+    name: collect
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: archive-*
+          path: release
+          merge-multiple: true
+      - name: Write SHA256SUMS
+        working-directory: release
+        env:
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: |
+          targets=$(sed -nE "s/^supported_targets='([^']*)'.*/\1/p" ../install.sh)
+          test -n "$targets" || { echo "install.sh lists no targets" >&2; exit 1; }
+          version=$(sed -nE '/^\[workspace\.package\]/,/^\[/ s/^version *= *"([^"]+)".*/\1/p' ../Cargo.toml)
+          for target in $targets; do
+            test -f "dudes-$version-$target.tar.gz" || { echo "missing dudes-$version-$target.tar.gz" >&2; exit 1; }
+          done
+          set -- dudes-*.tar.gz
+          test "$#" = "$(echo "$targets" | wc -w)" || { echo "unexpected archives: $*" >&2; exit 1; }
+          sha256sum dudes-*.tar.gz > SHA256SUMS
+          sha256sum --check SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: release
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish
+    needs: collect
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: release
+      - name: Create the GitHub Release
+        working-directory: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          sha256sum --check SHA256SUMS
+          case "$TAG" in
+            *-*) prerelease=--prerelease ;;
+            *) prerelease= ;;
+          esac
+          # shellcheck disable=SC2086
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "Dudes ${TAG#v}" \
+            --generate-notes $prerelease dudes-*.tar.gz SHA256SUMS

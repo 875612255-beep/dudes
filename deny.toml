@@ -1,0 +1,75 @@
+# cargo-deny configuration (format: cargo-deny 0.20, https://embarkstudios.github.io/cargo-deny/checks/cfg.html).
+# Run with `cargo deny check`. CI job: deny.
+
+[graph]
+all-features = true
+
+[output]
+feature-depth = 1
+
+# --- advisories: RustSec database; every vulnerability/unsound/notice advisory is an error ----------
+[advisories]
+db-path = "$CARGO_HOME/advisory-dbs"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+unmaintained = "workspace"
+ignore = [
+    # { id = "RUSTSEC-0000-0000", reason = "..." },
+]
+
+# --- licenses: allow-list only; anything else fails the build --------------------------------------
+[licenses]
+confidence-threshold = 0.93
+unused-allowed-license = "allow" # the list is ahead of the crates that will need it
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "Unlicense",
+]
+# Extending this list (e.g. MPL-2.0 for `option-ext` via `directories`) is a legal-review decision,
+# not a build fix. Crate-specific exceptions go in [[licenses.exceptions]] with a reason.
+exceptions = []
+
+[licenses.private]
+ignore = true
+
+# --- bans: duplicates, wildcards, second TLS stack ---------------------------------------------------
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+deny = [
+    # dudes-proxy is the only crate allowed to link a TLS stack, and that stack is rustls.
+    { crate = "native-tls", use-instead = "rustls", reason = "one TLS stack (invariant 9)" },
+    { crate = "openssl", use-instead = "rustls", reason = "one TLS stack (invariant 9)" },
+    { crate = "openssl-sys", use-instead = "rustls", reason = "one TLS stack (invariant 9)" },
+    # Journal payloads are serde_json in versioned frames; these are not the format.
+    { crate = "bincode", reason = "journal payloads are serde_json; bincode 3 is unmaintained" },
+    { crate = "postcard", reason = "journal payloads are serde_json; postcard is not the format" },
+    { crate = "sled", reason = "projections use redb" },
+]
+skip = []
+skip-tree = []
+
+[bans.workspace-dependencies]
+duplicates = "deny"
+include-path-dependencies = true
+unused = "allow" # workspace.dependencies is declared ahead of the crates that will use it
+
+# --- sources: crates.io only -----------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

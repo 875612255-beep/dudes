@@ -1,0 +1,385 @@
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
+import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from 'react';
+
+import { firstLinkRefused, pastedLinkBuildMismatch, pastedLinkRefused, subscribeToPastedLink } from './connect';
+import { AgentDrawer, Receipts } from './renderer/AgentDrawer';
+import { CONTROL_VIEWS, Control, ControlNav, FocusRoster, toggledView, viewButtonId } from './renderer/Control';
+import type { ControlView } from './renderer/Control';
+import { CrewList, drawerHandBack } from './renderer/CrewList';
+import { CrewStats } from './renderer/CrewTotals.tsx';
+import { PauseAllControl } from './renderer/control/PauseAllControl';
+import { DoneNotices } from './renderer/DoneNotices';
+import { OfficeCanvas } from './renderer/OfficeCanvas';
+import { getFloorState, selectOutputAgent, subscribeToFloor } from './renderer/floor/store';
+import { refreshFloorSnapshot } from './renderer/floor/stream';
+import { HireWizard } from './renderer/onboarding/HireWizard';
+import { HireEntry, hireSwitchOn } from './renderer/onboarding/HireEntry';
+import { FirstRunGuide } from './renderer/setup/FirstRunGuide';
+import { shouldOpenFirstRunGuide } from './renderer/setup/guide';
+import {
+  agentToReveal, getHireState, markRevealed, prepareArchiveHire, subscribeToHire,
+} from './renderer/onboarding/hire';
+import type { RetiredAgentRow } from './renderer/archive';
+import { AGENT_DETAIL_HEADING_ID, closesDrawer, focusAnswer, handFocusOnLeave, restoreFocusAfterDialog } from './renderer/focus';
+import { RetireDialog } from './renderer/retire/RetirePanel';
+import { selectedAgentRow } from './renderer/scene/selection';
+import { TerminalPanel } from './renderer/terminal/TerminalPanel';
+import { JournalStoppedBanner } from './renderer/JournalStoppedBanner';
+import { ClosingTimeBanner } from './renderer/ClosingTimeBanner';
+import { requestCardSelection } from './renderer/BoardPanel';
+import { StreamNotice } from './renderer/StreamNotice';
+import './failure.css';
+import {
+  DEFAULT_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH,
+  focusAgentId, isFocusShortcut, keyboardSidebarWidth, pointerSidebarWidth,
+  readGuideClosed, readViewPreferences, rememberGuideClosed, toggleTheme, writeViewPreferences,
+} from './renderer/view';
+
+/**
+ * Said when the link this page was opened with, or one pasted into it, was
+ * refused. Without it the page looks as it did, which reads as the link having
+ * worked. It names no part of the link: the secret stays out of the page. The
+ * page cannot tell why the daemon refused its first link, so it names every
+ * reason.
+ */
+export function PastedLinkNotice() {
+  const first = useSyncExternalStore(subscribeToPastedLink, firstLinkRefused, firstLinkRefused);
+  const refused = useSyncExternalStore(subscribeToPastedLink, pastedLinkRefused, pastedLinkRefused);
+  const buildMismatch = useSyncExternalStore(subscribeToPastedLink, pastedLinkBuildMismatch, pastedLinkBuildMismatch);
+  if (first) {
+    return (
+      <p className="link-refused" role="alert">
+        This sign-in link was refused. It was already used, it expired, or the daemon already has four Floor
+        sessions. If you did not use this link, another program on this computer may have. Run dudes floor open
+        again; if four sessions are open, restart the daemon first.
+      </p>
+    );
+  }
+  if (!refused) return null;
+  if (buildMismatch) {
+    return (
+      <p className="link-refused" role="alert">
+        The daemon now serves a different Floor build from this page, so the link pasted into this tab was not
+        used. This page is as it was, but it cannot sign in to the new build. Copy any draft you need, reload
+        this tab, then paste the link again.
+      </p>
+    );
+  }
+  return (
+    <p className="link-refused" role="alert">
+      The Floor link pasted into this tab was refused, or the daemon could not be reached to take it. This page is
+      as it was and keeps what it holds. For a new link, run dudes floor open --no-browser and paste it into this
+      tab’s address bar.
+    </p>
+  );
+}
+
+export function WebFloorShell() {
+  const floor = useSyncExternalStore(subscribeToFloor, getFloorState, getFloorState);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [hiring, setHiring] = useState(false);
+  const [guide, setGuide] = useState<'auto' | 'open' | 'closed'>(() => readGuideClosed() ? 'closed' : 'auto');
+  const [archiveHireKept, setArchiveHireKept] = useState(false);
+  const [officeBar, setOfficeBar] = useState<HTMLDivElement | null>(null);
+  const hire = useSyncExternalStore(subscribeToHire, getHireState, getHireState);
+  const [view, setView] = useState<ControlView | null>(null);
+  const [answerAsked, setAnswerAsked] = useState<{ readonly id: string } | null>(null);
+  const [crewOpen, setCrewOpen] = useState(true);
+  const [focused, setFocused] = useState(false);
+  const [preferences, setPreferences] = useState(readViewPreferences);
+  const [osDark, setOsDark] = useState(() => typeof window !== 'undefined'
+    && window.matchMedia('(prefers-color-scheme: dark)').matches);
+  const drag = useRef<{ pointerId: number; x: number; width: number } | null>(null);
+  const hireDialog = useRef<HTMLDialogElement | null>(null);
+  const hireOpener = useRef<HTMLElement | null>(null);
+  const backdropPress = useRef<number | null>(null);
+  const selectedRow = selectedAgentRow(floor.agents, selectedId, floor.phase, floor.stale);
+  const focusedId = focused ? focusAgentId(floor, selectedId) : null;
+  const displayRow = focused ? selectedAgentRow(floor.agents, focusedId, floor.phase, floor.stale) : selectedRow;
+  const currentSelectedId = displayRow?.id ?? null;
+  const selectable = floor.phase === 'live' && !floor.stale;
+  const effectiveTheme = preferences.theme === 'system' ? (osDark ? 'dark' : 'light') : preferences.theme;
+  const reveal = agentToReveal(hire, floor);
+  const drawerOpen = displayRow !== null || floor.output.targetId !== null;
+  const home = focused ? 'focus-toggle' : 'crew-toggle';
+  const leaveDrawerTo = drawerHandBack({ agent: currentSelectedId, focused, crewOpen, viewOpen: view !== null });
+
+  useEffect(() => {
+    if (reveal === null) return;
+    markRevealed(reveal);
+    selectAgent(reveal);
+    if (hire.outcome?.kind === 'complete') {
+      hireDialog.current?.close();
+      setHiring(false);
+      setGuide('closed');
+      setFocused(false);
+      setArchiveHireKept(false);
+    }
+  }, [reveal, hire.outcome?.kind]);
+
+  useEffect(() => {
+    writeViewPreferences(preferences);
+  }, [preferences]);
+
+  useEffect(() => {
+    if (guide === 'auto' && shouldOpenFirstRunGuide(floor, false)) setGuide('open');
+  }, [guide, floor]);
+
+  useEffect(() => {
+    const preference = window.matchMedia('(prefers-color-scheme: dark)');
+    const onThemePreference = () => setOsDark(preference.matches);
+    preference.addEventListener('change', onThemePreference);
+    return () => preference.removeEventListener('change', onThemePreference);
+  }, []);
+
+  useEffect(() => {
+    if (selectedId !== null && selectable && floor.lsn > 0 && selectedRow === null) {
+      selectOutputAgent(null);
+      setSelectedId(null);
+    }
+  }, [selectedId, selectedRow, selectable, floor.lsn]);
+
+  useEffect(() => {
+    if (answerAsked === null || currentSelectedId !== answerAsked.id) return;
+    setAnswerAsked(null);
+    focusAnswer(document.getElementById('selected-agent-detail'));
+  }, [answerAsked, currentSelectedId]);
+
+  useEffect(() => {
+    if (focused && selectedId === null && focusedId !== null) {
+      selectOutputAgent(focusedId);
+      setSelectedId(focusedId);
+    }
+  }, [focused, selectedId, focusedId]);
+
+  useEffect(() => {
+    const onShortcut = (event: KeyboardEvent) => {
+      const target = event.target;
+      const blocked = target instanceof Element && target.closest(
+        '.terminal-panel, .hire-wizard, .first-run-guide, input, textarea, select',
+      ) !== null;
+      if (!isFocusShortcut(event, blocked)) return;
+      event.preventDefault();
+      toggleFocus();
+    };
+    document.addEventListener('keydown', onShortcut);
+    return () => document.removeEventListener('keydown', onShortcut);
+  }, [focused, floor, selectedId]);
+
+  function selectAgent(id: string): boolean {
+    if (!selectable || !floor.agents.some((row) => row.id === id)) return false;
+    selectOutputAgent(id);
+    setSelectedId(id);
+    return true;
+  }
+
+  function openQuestion(id: string): void {
+    if (selectAgent(id)) setAnswerAsked({ id });
+  }
+
+  function openView(next: ControlView): void {
+    setFocused(false);
+    setView(next);
+    if (CONTROL_VIEWS.some((entry) => entry.view === next && entry.refresh)) refreshFloorSnapshot();
+  }
+
+  function toggleView(next: ControlView): void {
+    const target = toggledView(view, next, focused);
+    if (target === null) setView(null);
+    else openView(target);
+  }
+
+  function toggleCrew(): void {
+    if (focused) {
+      setFocused(false);
+      setCrewOpen(true);
+    } else {
+      setCrewOpen((open) => !open);
+    }
+  }
+
+  function openCard(id: string): void {
+    if (!selectable || !floor.cards.some((card) => card.id === id)) return;
+    requestCardSelection(id);
+    openView('board');
+  }
+
+  function hireAgain(row: RetiredAgentRow, opener: HTMLButtonElement): void {
+    backdropPress.current = null;
+    hireOpener.current = opener;
+    setArchiveHireKept(!prepareArchiveHire(row, floor));
+    setGuide('closed');
+    setHiring(true);
+  }
+
+  function openHire(opener: HTMLElement | null): void {
+    backdropPress.current = null;
+    hireOpener.current = opener;
+    setHiring(true);
+  }
+
+  function closeHire(): void {
+    backdropPress.current = null;
+    hireDialog.current?.close();
+    setHiring(false);
+    restoreFocusAfterDialog(hireOpener.current,
+      document.getElementById('hire-open') ?? document.getElementById('crew-toggle'));
+  }
+
+  useEffect(() => {
+    if (!hiring) return;
+    const dialog = hireDialog.current;
+    dialog?.showModal();
+    dialog?.querySelector<HTMLElement>('#hire-title')?.focus();
+  }, [hiring]);
+
+  function clearSelection(): void {
+    if (focused) setFocused(false);
+    selectOutputAgent(null);
+    setSelectedId(null);
+  }
+
+  function toggleFocus(): void {
+    if (!focused) {
+      setHiring(false);
+      const id = focusAgentId(floor, selectedId);
+      if (id !== null) selectAgent(id);
+    }
+    setFocused((active) => !active);
+    document.getElementById('focus-toggle')?.focus();
+  }
+
+  function startResize(event: ReactPointerEvent<HTMLDivElement>): void {
+    if (!event.isPrimary || event.button !== 0) return;
+    drag.current = { pointerId: event.pointerId, x: event.clientX, width: preferences.sidebarWidth };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    event.preventDefault();
+  }
+
+  function moveResize(event: ReactPointerEvent<HTMLDivElement>): void {
+    const start = drag.current;
+    if (start === null || event.pointerId !== start.pointerId) return;
+    const width = pointerSidebarWidth(start.width, start.x, event.clientX);
+    setPreferences((current) => ({ ...current, sidebarWidth: width }));
+  }
+
+  function endResize(event: ReactPointerEvent<HTMLDivElement>): void {
+    const start = drag.current;
+    if (start === null || event.pointerId !== start.pointerId) return;
+    const width = pointerSidebarWidth(start.width, start.x, event.clientX);
+    setPreferences((current) => ({ ...current, sidebarWidth: width }));
+    drag.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  }
+
+  function keyResize(event: ReactKeyboardEvent<HTMLDivElement>): void {
+    const width = keyboardSidebarWidth(preferences.sidebarWidth, event.key);
+    if (width === null) return;
+    event.preventDefault();
+    setPreferences((current) => ({ ...current, sidebarWidth: width }));
+  }
+
+  function resetSidebar(): void {
+    setPreferences((current) => ({ ...current, sidebarWidth: DEFAULT_SIDEBAR_WIDTH }));
+  }
+
+  const splitter = <div className="panel-splitter" role="separator" tabIndex={0}
+    aria-label={focused ? 'Resize roster' : 'Resize agent details'}
+    aria-orientation="vertical" aria-valuemin={MIN_SIDEBAR_WIDTH} aria-valuemax={MAX_SIDEBAR_WIDTH}
+    aria-valuenow={preferences.sidebarWidth} aria-valuetext={`${preferences.sidebarWidth} pixels`}
+    onPointerDown={startResize} onPointerMove={moveResize} onPointerUp={endResize}
+    onPointerCancel={endResize} onKeyDown={keyResize} onDoubleClick={resetSidebar} />;
+  const drawer = <AgentDrawer floor={floor} row={displayRow} selectedId={currentSelectedId} onClose={clearSelection}
+    leaveFocusTo={leaveDrawerTo} />;
+
+  return (
+    <main className="shell" aria-labelledby="floor-title" data-focus={focused ? 'true' : 'false'}
+      data-theme={preferences.theme} style={{ '--side-width': `${preferences.sidebarWidth}px` } as CSSProperties}>
+      <header className="top-bar">
+        <h1 id="floor-title" className="wordmark">dudes</h1>
+        <CrewStats agents={floor.agents} />
+        <ControlNav floor={floor} view={focused ? null : view} onToggle={toggleView} />
+        <div className="top-bar-actions" role="group" aria-label="Floor actions">
+          <button type="button" className="crew-toggle" id="crew-toggle" aria-pressed={crewOpen && !focused}
+            aria-controls={crewOpen && !focused ? 'crew-list' : undefined}
+            onClick={toggleCrew}>Crew</button>
+          <button type="button" className="focus-toggle" id="focus-toggle" aria-pressed={focused}
+            aria-keyshortcuts="Alt+Shift+F" onClick={toggleFocus}>
+            {focused ? 'Leave focus' : 'Focus agent'}
+          </button>
+          {hireSwitchOn(floor) ? <button type="button" className="hire-open" id="hire-open" aria-expanded={hiring}
+            aria-controls={hiring ? 'hire-wizard' : undefined}
+            onClick={(event) => openHire(event.currentTarget)}>Hire an agent</button> : null}
+          <PauseAllControl floor={floor} />
+          <button type="button" className="theme-toggle" aria-pressed={effectiveTheme === 'dark'}
+            onClick={() => setPreferences((current) => ({ ...current, theme: toggleTheme(current.theme, osDark) }))}>
+            Use {effectiveTheme === 'dark' ? 'light' : 'dark'} theme
+          </button>
+        </div>
+        <PastedLinkNotice />
+        <JournalStoppedBanner stopped={floor.journalStopped} />
+        <ClosingTimeBanner closing={floor.closingTime} stale={floor.stale} />
+        <StreamNotice floor={floor} />
+        <div className="office-bar" ref={setOfficeBar} />
+      </header>
+      <div className="floor-stage"
+        onKeyDown={(event) => { if (closesDrawer(event, drawerOpen)) { event.stopPropagation(); clearSelection(); } }}>
+        {crewOpen && !focused ? <CrewList agents={floor.agents} cards={floor.cards} selectedId={currentSelectedId}
+          selectable={selectable} stale={floor.stale} onSelectAgent={selectAgent}
+          onOpenCard={openCard}
+          addAgent={<HireEntry floor={floor} id="hire-open-crew" onAddAgent={openHire} folded />} /> : null}
+        {view === null || focused ? null : <Control key={view} floor={floor} view={view} selectedId={currentSelectedId}
+          onClose={() => setView(null)} onView={openView} onHireAgain={hireAgain}
+          onGuide={() => { setFocused(false); setHiring(false); setGuide('open'); }} />}
+        <div className="office-slot">
+          <OfficeCanvas floor={floor} selectedId={currentSelectedId} onSelectAgent={selectAgent} onOpenQuestion={openQuestion}
+            onOpenTasks={() => openView('board')} onAddAgent={openHire} bar={officeBar} />
+        </div>
+        <DoneNotices notices={floor.doneNotices} leaveFocusTo={home} />
+        <div className="stage-center">
+          <TerminalPanel floor={floor} theme={effectiveTheme} />
+        </div>
+        <div className="stage-side">
+          <Receipts floor={floor} leaveFocusTo={displayRow === null ? home : AGENT_DETAIL_HEADING_ID} />
+          {focused ? <section className="focus-mode" aria-label="Focus mode" ref={handFocusOnLeave}
+            data-focus-on-leave="focus-toggle">
+            <h2>Focused agent</h2>
+            <div className="focus-frame">
+              {drawer}
+              {splitter}
+              <FocusRoster floor={floor} selectedId={currentSelectedId} onSelectAgent={selectAgent}
+                onHireAgain={hireAgain} onAddAgent={openHire} collapsed={preferences.rosterCollapsed}
+                onToggle={() => setPreferences((current) => ({ ...current, rosterCollapsed: !current.rosterCollapsed }))} />
+            </div>
+          </section> : drawerOpen ? <div className="drawer-frame">{splitter}{drawer}</div> : null}
+        </div>
+        {guide === 'open' ?
+          <FirstRunGuide floor={floor} onClose={() => {
+            rememberGuideClosed(); setGuide('closed');
+            (document.getElementById('first-run-guide-open') ?? document.getElementById(viewButtonId('setup'))
+              ?? document.getElementById('hire-open'))?.focus();
+          }} onHire={(opener) => openHire(opener)} /> : null}
+      </div>
+      <RetireDialog floor={floor} />
+      {hiring ? <dialog className="hire-dialog" ref={hireDialog}
+        aria-labelledby="hire-title" onCancel={(event) => { event.preventDefault(); closeHire(); }}
+        onPointerDown={(event) => {
+          backdropPress.current = event.target === event.currentTarget && event.button === 0 && event.isPrimary
+            ? event.pointerId : null;
+        }}
+        onPointerUp={(event) => {
+          const dismiss = backdropPress.current === event.pointerId
+            && event.currentTarget.ownerDocument.elementFromPoint(event.clientX, event.clientY) === event.currentTarget
+            && event.button === 0 && event.isPrimary;
+          backdropPress.current = null;
+          if (dismiss) closeHire();
+        }}
+        onPointerCancel={() => { backdropPress.current = null; }}>
+        {archiveHireKept ? <p role="status">The current Hire is kept. Resolve it before preparing another agent.</p> : null}
+        <HireWizard floor={floor} onClose={closeHire} />
+      </dialog> : null}
+    </main>
+  );
+}

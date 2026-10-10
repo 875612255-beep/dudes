@@ -1,0 +1,2340 @@
+//! The supervisor's own fold of confirmed entries, and the `LoopInput` it assembles from them.
+//!
+//! `dudes-supervisor` does not depend on `dudes-journal`: reading redb inside `handle()` is I/O,
+//! and the crate is sans-io by rule. So it keeps this — a projection in the sense of invariant 1,
+//! rebuildable, folded from entries that have actually reached the disk. `Input::Replayed` and
+//! `Input::Persisted` call the *same* [`World::apply`], which is what makes a replayed decision
+//! equal to the live one and the crash test meaningful rather than decorative.
+//!
+//! No spend arithmetic or ordinary display context lives here. Canonical mail-wake metadata
+//! qualifies completed receipts and validates issued authority without retaining content. The fold holds
+//! agent, goal and turn lifecycle, and the agent-token hashes a presented token resolves against
+//! ([`World::agent_for_token_hash`]); the money arrives on
+//! [`Input::Spend`](crate::Input::Spend), computed by the caller from the budget projections, and gate 7's card, mail count and memory digest arrive the same way on
+//! [`Input::Work`](crate::Input::Work). The supervisor could not read any of them either way, so
+//! there is nothing to duplicate — one rule, one implementation.
+
+use std::cell::OnceCell;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::PathBuf;
+
+mod mail_wakes;
+mod mcp;
+mod worktrees;
+
+pub use mcp::{McpGrant, McpHistoryError, McpPolicy};
+pub use worktrees::{WorktreeRow, WorktreeState};
+
+use dudes_policy::{
+    AgentInput, AnswerInput, Control, FloorInput, GoalInput, LoopInput, PredicateInput, WorkInput,
+};
+use dudes_proto::{
+    AgentBudget, BrowserNoteDestination, Entry, GateStep, Goal, LoopDecision, NoteAdmission,
+    NoteContract, Predicate, Record, TurnOutcome,
+};
+use dudes_types::{
+    AgentId, AgentStatus, BreakerRung, CardId, GoalId, Lsn, ModelSelection, Provenance, Provider,
+    SessionId, TurnId, TurnStatus, Usage, Usd, WorktreeId,
+};
+
+use crate::host::AdoptionKey;
+use crate::input::SpendView;
+
+/// How many undelivered steer notes one agent may hold before the oldest is dropped.
+///
+/// **The fold does not enforce this; the producer does.** Enforcing it here would mean dropping a
+/// note inside [`World::apply`], and a drop that changes what the fold holds must be a record
+/// (invariant 1) — which a fold cannot append, having no effects. So
+/// `Supervisor::on_command(Command::Steer)` persists a `SteerCleared` before the `Steer` that
+/// displaces it, and the fold below is append-and-remove with no eviction arm. The two paths then
+/// see one record sequence and cannot disagree.
+pub const MAX_PENDING_STEERS: usize = 20;
+
+/// One agent, as the confirmed entries describe it.
+///
+/// The four flags are four separate journaled facts — `AgentRetired`, `Halt`, `Pause` and
+/// `Attached` — read by different gates and cleared by different records. Packing them into one
+/// enum would claim they are mutually exclusive, and a halted agent that is also attached is an
+/// ordinary state.
+#[derive(Clone, Debug)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct AgentRow {
+    /// Display name.
+    pub name: String,
+    /// Authored cast character. Absence preserves the automatic appearance.
+    pub character: Option<dudes_types::CastCharacter>,
+    /// Named accent colour. Absence preserves the neutral accent.
+    pub accent: Option<dudes_types::AccentColour>,
+    /// Role text.
+    pub role: String,
+    /// Newest appearance edit, used to reject a stale browser edit. Absent before the first edit.
+    pub look_lsn: Option<Lsn>,
+    /// Department.
+    pub department: String,
+    /// Which CLI drives it.
+    pub provider: Provider,
+    /// The repository it works in.
+    pub cwd: PathBuf,
+    /// Daily ceiling.
+    pub budget: AgentBudget,
+    /// The provider's sandbox on-switch, as the hire asked for it.
+    pub sandbox: Option<bool>,
+    /// The vendor-run turn cap recorded at hire, or `None` for no cap. Replayed,
+    /// never re-read from configuration, so a re-issue carries what the hire recorded.
+    pub max_turns: Option<u32>,
+    /// The vendor-run budget backstop recorded at hire, or `None` for none. Not a
+    /// spend ceiling and no part of gate 5's admission — see `Record::AgentHired::max_budget`.
+    pub max_budget: Option<Usd>,
+    /// Whether the operator vouched for the repository at hire.
+    pub trusted: bool,
+    /// The lease this agent was hired into, when it was hired into a worktree.
+    pub worktree: Option<WorktreeId>,
+    /// Desired managed-launch names and the immutable recorded hire origin.
+    pub mcp: McpPolicy,
+    /// `AgentRetired` was appended.
+    pub retired: bool,
+    /// `loop.halt` is standing (gate 1).
+    pub halted: bool,
+    /// `loop.pause` is standing (gate 1).
+    pub paused: bool,
+    /// A human holds the keyboard (gate 1).
+    pub attached: bool,
+    /// The agent's control identity: where its newest `Pause`, `Resume`, `Halt` or `AgentHeld` sits, local or
+    /// browser, older format or not. `None` until one is journaled. A Floor pause or resume applies
+    /// only while the page presents this value.
+    pub control_lsn: Option<Lsn>,
+    /// Standing automatic cause, cleared by Resume or a new goal.
+    pub automatic_hold: Option<dudes_proto::AutomaticHold>,
+    /// First and latest consecutive qualifying failures of the current goal.
+    pub fast_failures: Option<(TurnId, TurnId)>,
+    /// The isolated beat for this failure episode is durable.
+    pub rapid_failure_beat: bool,
+    /// A current-goal launch failure whose automatic hold is not yet durable.
+    pub pending_launch_failure: Option<dudes_proto::AutomaticHold>,
+    /// A `HumanQuestion` without a `HumanAnswer` (gate 3).
+    pub open_question: Option<String>,
+    /// Where the `HumanQuestion` that opened [`AgentRow::open_question`] sits — the question's
+    /// identity, which the Floor's answer names. Set and cleared with it.
+    pub question_lsn: Option<Lsn>,
+    /// Exact finite-turn origin when the current question belongs to a conversation.
+    pub conversation_question: Option<dudes_proto::ConversationQuestionOrigin>,
+    /// Answers that closed this agent's questions and that no spawned turn has carried yet,
+    /// oldest first.
+    ///
+    /// **Delivered only by a `TurnSpawned`**, and only the answers its own `TurnIssued` listed: a
+    /// turn that is never issued, never spawned or refused at launch leaves them here for the next
+    /// one. The one other removal is a `TurnIssued` written before answers were
+    /// recorded retires, undelivered, those decided before it. Removal is by position, so folding
+    /// the same spawn twice removes nothing more. Like
+    /// [`AgentRow::steers`], nothing durable holds this: it is the fold of the answer records.
+    pub pending_answers: VecDeque<PendingAnswer>,
+    /// Provenance of the highest-`lsn` `TurnEnded` for this agent (gate 2).
+    pub last_turn_end: Option<Provenance>,
+    /// The goal it pursues; `None` before `goal.set` and after `goal.clear`.
+    pub goal: Option<GoalId>,
+    /// Latest goal or vendor-context revision, initially the hire position.
+    pub context_lsn: Lsn,
+    /// Current breaker rung (gate 5).
+    pub rung: BreakerRung,
+    /// Operator corrections waiting to be delivered, oldest first, at most
+    /// [`MAX_PENDING_STEERS`] of them.
+    ///
+    /// **A queue and not a slot, and each note is named by where it was journaled.** The `Lsn` is
+    /// the position of the [`Record::Steer`] that queued it, which is what a later
+    /// `SteerConsumed` or `SteerCleared` names — so removal is by identity rather than by
+    /// position in the queue, and folding the same removal twice is a no-op. A slot would let a
+    /// second correction destroy an undelivered first, and an index would let a concurrent
+    /// removal take the wrong note.
+    ///
+    /// Bounded without a new cap on memory: one note is already capped at
+    /// `dudes_rpc::conditioned::MAX_AGENT_STEER_TEXT_BYTES` (64 KiB), so an agent's queue is at
+    /// most 1.25 MiB, here in the in-memory fold only. Nothing durable holds it: the redb
+    /// `AgentRow` has no steer column, so `PROJECTION_VERSION` is untouched by this.
+    pub steers: VecDeque<(Lsn, String)>,
+    /// The vendor-confirmed session for this agent: the id the vendor named back to us, and the
+    /// only one a later turn may resume. `SessionLearned` is its only establishing
+    /// writer; a session-invalidating record and a replayed launch refusal may clear it. Announcing an
+    /// id the daemon minted does not confirm it, so this stays `None` until the vendor speaks.
+    pub session: Option<SessionId>,
+    /// The turn in flight, when there is one.
+    pub open_turn: Option<TurnId>,
+    /// `input_digest` from this agent's **most recent** `LoopDecided`, and `None` before its first
+    /// one.
+    ///
+    /// What the tick's re-examination of an `Exhausted` agent compares against. A projection like
+    /// everything else here, which is what makes the guard survive a restart without a second
+    /// mechanism and lets `dudes why` answer "why has nothing happened since 3am" out of the
+    /// journal.
+    ///
+    /// Carries whatever the record carries, empty string included: the machine journals an empty
+    /// `input_digest` when the input could not be serialised (`Supervisor::decide`), and this field
+    /// is that record's field rather than a second opinion about it.
+    pub last_input_digest: Option<String>,
+}
+
+/// One answer waiting for a spawned turn to carry it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingAnswer {
+    /// Where its `HumanAnswer` sits: what the carrying `TurnIssued.answers` names.
+    pub lsn: Lsn,
+    /// The question it closed, as it was asked.
+    pub question: String,
+    /// The answer, verbatim.
+    pub text: String,
+}
+
+/// One goal, as the confirmed entries describe it.
+#[derive(Clone, Debug)]
+pub struct GoalRow {
+    /// The goal itself.
+    pub goal: Goal,
+    /// Who pursues it.
+    pub agent: AgentId,
+    /// Managed turn issues for this goal so far (gate 6), saturated at `u32::MAX`.
+    /// Same-ID reissue and attached ends add no hop.
+    pub turns_on_goal: u32,
+    /// The latest `PredicateResult` (gate 4).
+    pub predicate: Option<PredicateInput>,
+    /// The most recent turn issued for this goal, so a predicate result names the turn it ran
+    /// after.
+    pub last_turn: Option<TurnId>,
+    /// `GoalCleared` was appended.
+    pub cleared: bool,
+}
+
+/// One turn, as the confirmed entries describe it.
+#[derive(Clone, Debug)]
+pub struct TurnRow {
+    /// The agent.
+    pub agent: AgentId,
+    /// The goal it serves.
+    pub goal: Option<GoalId>,
+    /// Where it is in its life.
+    pub status: TurnStatus,
+    /// The latest id any of this turn's records named: `TurnIssued`'s, then any `TurnSpawned`,
+    /// `SessionLearned` or `TurnEnded` that names one. A record naming none keeps it,
+    /// so after a crash it can still hold the crashed launch's id. Not a resumable session — a
+    /// re-issue reads [`AgentRow::session`], never this.
+    pub session: Option<SessionId>,
+    /// The session the turn's latest launch announced: `TurnIssued`'s, then each `TurnSpawned`'s,
+    /// `None` where that launch announced nothing. Unlike [`TurnRow::session`], a launch that
+    /// announced nothing replaces an earlier id.
+    pub announced: Option<SessionId>,
+    /// Whether this turn has a durable `SessionLearned`. The record is emitted only after the
+    /// machine has checked that the vendor confirmed the session this launch announced, so this
+    /// flag means "confirmed for this turn" rather than merely "some id was reported".
+    pub session_confirmed: bool,
+    /// The task text, kept so a re-issued turn launches the same work.
+    pub task: String,
+    /// The answers `TurnIssued` recorded as carried by [`TurnRow::task`]. Its `TurnSpawned`,
+    /// first or re-issued, consumes exactly these.
+    pub answers: Vec<Lsn>,
+    /// The model selection `TurnIssued` recorded, kept for the same reason as the task: a
+    /// re-issued turn launches under the model the journal says it was issued under, not under
+    /// whatever the adapter is configured with now. `None` is a journal written
+    /// before the field, and is the only case that falls back to current configuration.
+    ///
+    /// The observed per-model breakdown is deliberately **not** here: this crate decides nothing
+    /// from it, and the run-local world carries only what a decision or a relaunch needs.
+    /// It lives on the persistent turn row instead.
+    pub model_selection: Option<ModelSelection>,
+    /// The child's pid, once `TurnSpawned` recorded it.
+    pub pid: Option<u32>,
+    /// The child's platform-native start value.
+    pub start_time: Option<u64>,
+    /// The boot identity stamped at spawn.
+    pub boot: Option<String>,
+    /// Latest physical spawn receipt position, absent before a child was recorded.
+    pub spawn_lsn: Option<Lsn>,
+    /// Immutable grant paired with the latest physical spawn receipt.
+    pub mcp_grant: Option<Lsn>,
+}
+
+impl TurnRow {
+    /// `TurnIssued` is fsynced and no `TurnSpawned` followed: replay re-issues this turn exactly
+    /// once, under the same `TurnId`.
+    #[must_use]
+    pub const fn is_issued_not_spawned(&self) -> bool {
+        matches!(self.status, TurnStatus::Issued)
+    }
+
+    /// A child was recorded and no end was: the reaper asks about this one.
+    #[must_use]
+    pub const fn is_open_child(&self) -> bool {
+        matches!(self.status, TurnStatus::Spawned)
+    }
+
+    /// A `TurnEnded` for this turn is fsynced and folded, whichever outcome it carried.
+    ///
+    /// The *persistent* half of "this turn is already ending". It cannot be the whole of it: the
+    /// status moves on the acknowledged entry, so between an end being emitted and its
+    /// acknowledgement this still answers `false` — which is exactly the crash window a second
+    /// end would slip through. The run-local half lives on the machine.
+    #[must_use]
+    pub const fn has_ended(&self) -> bool {
+        matches!(self.status, TurnStatus::Ended | TurnStatus::Killed)
+    }
+
+    /// The session this turn ends on: the one it confirmed, else the one its latest launch
+    /// announced.
+    #[must_use]
+    pub fn ended_session(&self) -> Option<SessionId> {
+        if self.session_confirmed {
+            self.session.clone()
+        } else {
+            self.announced.clone()
+        }
+    }
+
+    /// The key a `Kill` or a `Probe` names this turn's child by, when `TurnSpawned` recorded one.
+    ///
+    /// **The one place a key is rebuilt from the record**. A key is three fields
+    /// that must travel together — the identifier, the opaque start value and the boot identity
+    /// whose *presence* is itself part of the comparison — and a second site that assembled two of
+    /// them and defaulted the third would reintroduce the false `Gone` that
+    /// [`liveness()`](crate::host::liveness) exists to prevent.
+    #[must_use]
+    pub fn adoption_key(&self) -> Option<AdoptionKey> {
+        Some(AdoptionKey {
+            pid: self.pid?,
+            start_time: self.start_time?,
+            boot: self.boot.clone(),
+        })
+    }
+}
+
+/// Outcomes reached after the daemon read a managed child's stream through its end. The two
+/// no-stream outcomes deliberately stay out: `Vanished` was observed by the reaper, and `Killed`
+/// tests only that the daemon could stop the child.
+fn qualifying_unconfirmed_resume_end(outcome: Option<&TurnOutcome>) -> bool {
+    matches!(
+        outcome,
+        Some(
+            TurnOutcome::Completed
+                | TurnOutcome::MaxTurns
+                | TurnOutcome::BudgetExhausted
+                | TurnOutcome::Failed { .. }
+                | TurnOutcome::NoResult
+        )
+    )
+}
+
+/// The fold. Every field is derivable from the journal; nothing here is authoritative.
+///
+/// **`#[non_exhaustive]`, because a `World` a caller assembled is a `World` the journal never
+/// produced.** Invariant 1 makes the journal the only writer and this struct a projection of it,
+/// so the honest way to obtain one is [`World::default`] folded forward by [`World::apply`] —
+/// the path `dudes replay` itself takes. A downstream struct expression would mint a projection
+/// with no records behind it: a state no journal can emit and no replay can reproduce, carrying
+/// whatever cross-field disagreement the caller happened to type. Closing the constructor is
+/// therefore a property this type wants, not a cost it pays, and it should not rest on which
+/// fields happen to be private this week.
+///
+/// Which is why the attribute and not just the private field that closed construction by
+/// accident. `minted` is private because its key set is only half of token validity, and
+/// making it private is what shuts the constructor, and adding a private field to a
+/// constructible struct is a major break (`constructible_struct_adds_private_field`). A closure
+/// resting on one field's visibility lasts exactly as long as that visibility: measured, making
+/// `minted` public re-opens the struct to a downstream literal, and under this attribute it
+/// stays shut. The attribute buys that for nothing — a struct with a private field and a
+/// `#[non_exhaustive]` struct admit the same downstream forms (`Default`, public field reads,
+/// patterns written with `..`) and refuse the same literals; only the diagnostic moves.
+///
+/// It does not undo the break it declares. A caller compiled against the struct while it was
+/// open stays broken, and `cargo semver-checks` still requires a major version against any
+/// pre-`minted` baseline — as `struct_marked_non_exhaustive` rather than the constructibility
+/// lint. Only the version can settle that.
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct World {
+    /// Latest journal-derived closure; a completed session remains historical.
+    pub closing: Option<crate::closing::ClosingSession>,
+    /// Agents by id.
+    pub agents: BTreeMap<AgentId, AgentRow>,
+    /// Goals by id.
+    pub goals: BTreeMap<GoalId, GoalRow>,
+    /// Turns by id.
+    pub turns: BTreeMap<TurnId, TurnRow>,
+    mcp_grants: BTreeMap<Lsn, McpGrant>,
+    /// The position of the last entry [`World::apply`] folded, or `None` before the first.
+    ///
+    /// The fold's own record of where it has reached, so that a record which has to be named by
+    /// its position — a note removed by the `lsn` that set it — has a position to
+    /// be named by. Nothing decides on it: it is not read by [`World::loop_input`] and so never
+    /// reaches `dudes_policy::decide()`, which reads no clock and no position (invariant 5).
+    ///
+    /// The same name as `dudes_journal::Projections::last_applied_lsn` because it is the same
+    /// fact about the other projection of the same journal, and a second word for one fact is
+    /// how a glossary rots. `Option` rather than that one's `Lsn::ZERO` sentinel is the one
+    /// deliberate difference, and it is a typing decision rather than a value being reserved:
+    /// [`Lsn`] derives `Default` and `Lsn::default()` is `Lsn::ZERO` (`dudes-types/src/id.rs`),
+    /// so a bare field would leave [`World::default`] indistinguishable from a fold that stored
+    /// `Lsn::ZERO` — which is exactly what a caller that dropped the position hands over. The
+    /// `Option` makes "this fold has not started" a state every reader must handle rather than a
+    /// value it has to recognise.
+    pub last_applied_lsn: Option<Lsn>,
+    /// The latest qualifying unconfirmed resume per agent, derived from the journal for
+    /// `system.doctor` and read by no decision.
+    unconfirmed_resumes: BTreeMap<AgentId, TurnId>,
+    /// Which agent each journaled agent-token hash was minted for, keyed by the hash.
+    ///
+    /// **Keyed by the hash, not by the agent, and that is the whole of token validity.** A
+    /// hash is valid by *set membership*, never by recency: the plaintext does not survive a
+    /// restart, so a later run draws again for the same agent while a child adopted across that
+    /// restart still presents the earlier token. A map `agent -> hash` would evict that child's
+    /// credential and refuse its every call — after a crash only, for adopted children only,
+    /// looking exactly like a permissions bug. Nothing is removed from here.
+    ///
+    /// **What a presented token resolves to is decided by `classify`**, cited and not restated —
+    /// not by this field, which only feeds the honoured-token cell.
+    /// `classify` decides which of the classification table's token rows a presented token
+    /// selects; this map decides only whether a minting exists for its hash.
+    ///
+    /// **The one private field, because its key set is only part of the answer.** The rest is
+    /// retirement and the retired agent's recorded children, which [`World::agent_for_token_hash`]
+    /// applies and a caller reading the map directly would not. Membership without them cannot
+    /// tell the table's token rows apart, so there are two doors and both apply them:
+    /// [`World::agent_for_token_hash`] answers about one hash, and
+    /// [`World::token_hash_owners`] answers about all of them at once for a reader on another
+    /// thread, which is the one the daemon's `MintedTokens` adapter reads.
+    minted: BTreeMap<String, AgentId>,
+    /// Each attached agent's PTY child, by agent: the key its `PtySpawned` recorded, held until
+    /// that agent's `Detached`. Keyed by agent and never by `PtyId`, which a
+    /// later run reuses.
+    attached_children: BTreeMap<AgentId, AdoptionKey>,
+    /// Each session's running total as the journal last recorded it, over the turns whose
+    /// session the vendor confirmed.
+    session_totals: BTreeMap<SessionId, Usage>,
+    /// Goals the loop has decided `Done`: the goal its agent held when each `LoopDecided::Done`
+    /// was folded, the relation the journal's goals projection uses for `Achieved`. A goal here is
+    /// not decided again, whoever holds it, so a replayed result that no longer passes cannot
+    /// reopen it.
+    completed_goals: BTreeMap<GoalId, Lsn>,
+    browser_notes: BTreeMap<Lsn, BrowserNoteRow>,
+    conversation_decisions: BTreeMap<AgentId, (Lsn, Lsn, Lsn, NoteAdmission, String)>,
+    browser_issues: BTreeMap<TurnId, BrowserIssueRow>,
+    note_decisions: BTreeMap<AgentId, NoteDecisionRow>,
+    ordinary_continues: BTreeMap<Lsn, (AgentId, GoalId)>,
+    mail_wakes: mail_wakes::Fold,
+    /// Every lease the journal holds, by id, removed ones included.
+    pub worktrees: BTreeMap<WorktreeId, WorktreeRow>,
+}
+
+/// Durable browser-note lifecycle, separate from legacy local steering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BrowserNoteState {
+    /// Awaiting an eligible delivery seam.
+    Queued,
+    /// Reserved by an exact immutable issue.
+    Reserved {
+        /// The carrying turn.
+        turn: TurnId,
+    },
+    /// Consumed by a matched durable spawn.
+    Delivered {
+        /// The carrying turn.
+        turn: TurnId,
+    },
+    /// Closed by an end without an observed spawn.
+    Failed {
+        /// The failed carrying turn.
+        turn: TurnId,
+    },
+    /// Emitted through an Attached hook.
+    ContextEmitted,
+    /// Proven undelivered and durably cancelled.
+    Cancelled,
+    /// Future dispatch cancelled with possible past delivery.
+    ReissueCancelled {
+        /// The unresolved carrying turn.
+        turn: TurnId,
+    },
+}
+
+/// A journal-derived browser note, keyed by its queue lsn.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct BrowserNoteRow {
+    /// Owning agent.
+    pub agent: AgentId,
+    /// Complete normalized queued text.
+    pub text: String,
+    /// Continuation framing for an exact structured answer.
+    pub task: Option<String>,
+    /// The answered question identity gives continuations queue priority.
+    pub answer_to: Option<Lsn>,
+    /// Immutable admission destination.
+    pub destination: BrowserNoteDestination,
+    /// Durable delivery state.
+    pub state: BrowserNoteState,
+}
+
+/// The durable cancellation disposition for an issued browser-note turn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BrowserIssueCancellation {
+    /// Nonlaunch proven across every historical attempt.
+    Clean {
+        /// Cancellation position.
+        lsn: Lsn,
+    },
+    /// Future dispatch stopped without claiming past nonlaunch.
+    Ambiguous {
+        /// Cancellation position.
+        lsn: Lsn,
+        /// The unresolved historical intent.
+        dispatch_intent_lsn: Lsn,
+    },
+}
+
+/// Exact issue ownership and every historical dispatch attempt.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct BrowserIssueRow {
+    /// Owning agent.
+    pub agent: AgentId,
+    /// Queued note identity.
+    pub note_lsn: Lsn,
+    /// Immutable issuance position.
+    pub issue_lsn: Lsn,
+    /// Original charged goal.
+    pub goal: Option<GoalId>,
+    /// Whether this task is a separately admitted completed-goal note.
+    pub note_only: bool,
+    /// Ordinary completion proof on note-only issuance.
+    pub completion_lsn: Option<Lsn>,
+    /// Raw or taught completed-note authority; absent for ordinary note-bearing work.
+    pub contract: Option<NoteContract>,
+    /// Every durable dispatch intent for this `TurnId`, in order.
+    pub dispatch_intents: Vec<Lsn>,
+    /// Prior dispatches already charged one conservative unknown-use reserve.
+    pub uncertain_dispatches: Vec<Lsn>,
+    /// Matching durable spawn observation.
+    pub spawn_lsn: Option<Lsn>,
+    /// Whether the latest recorded launch was a recovery attempt.
+    pub reissued: bool,
+    /// Matching end observation.
+    pub end_lsn: Option<Lsn>,
+    /// Durable clean or ambiguous cancellation tombstone.
+    pub cancellation: Option<BrowserIssueCancellation>,
+}
+
+/// The latest separately typed completed-note admission for an agent.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct NoteDecisionRow {
+    /// Decision position.
+    pub lsn: Lsn,
+    /// Original completed goal.
+    pub goal: GoalId,
+    /// Exact eligible note.
+    pub note_lsn: Lsn,
+    /// Ordinary Done proof.
+    pub completion_lsn: Lsn,
+    /// Completed-note input digest.
+    pub input_digest: String,
+    /// Ordered gate trace.
+    pub gate_trace: Vec<GateStep>,
+    /// Admission without a Done alternative.
+    pub decision: NoteAdmission,
+    /// The immutable payload contract admitted by this decision kind.
+    pub contract: NoteContract,
+}
+
+impl World {
+    /// Fold one confirmed entry, appended at `lsn`.
+    ///
+    /// The `match` is exhaustive on `Record`, so a new variant fails to compile here rather than
+    /// being silently ignored. Records the gates do not read yet get a named no-op arm, never a
+    /// `_ =>`.
+    ///
+    /// The identical empty arms at the end are deliberately not merged: each names a different
+    /// journaled fact and the reader it will get, and merging them would lose
+    /// exactly that.
+    ///
+    /// `lsn` is the position of the frame the entry came out of, which the entry itself does not
+    /// carry (`dudes_proto::Entry` is `at` plus the record). Both callers hold it — replay reads
+    /// it from the log and the live path is acknowledged with it — so the two folds agree on the
+    /// position of every entry, which is what lets a record be named by where it sits.
+    #[allow(clippy::too_many_lines, clippy::match_same_arms)]
+    pub fn apply(&mut self, lsn: Lsn, entry: &Entry) {
+        if let Record::TurnEnded {
+            final_reply: Some(reply),
+            last_message,
+            mode,
+            provenance,
+            ..
+        } = &entry.record
+            && (last_message.is_some()
+                || reply.text.len() > dudes_proto::MAX_CHAT_REPLY_BYTES
+                || *mode != dudes_types::Mode::Managed
+                || *provenance != Provenance::Observed)
+        {
+            return;
+        }
+        let mut wakes = std::mem::take(&mut self.mail_wakes);
+        wakes.apply(self, lsn, entry);
+        self.mail_wakes = wakes;
+        self.last_applied_lsn = Some(lsn);
+        if matches!(
+            entry.record,
+            Record::ClosingTime {
+                phase: dudes_proto::ClosingPhase::Complete
+            }
+        ) && self
+            .closing
+            .as_ref()
+            .is_some_and(|session| !session.is_complete())
+        {
+            let managed = self
+                .turns
+                .iter()
+                .filter_map(|(turn, row)| {
+                    (row.is_open_child()
+                        || (row.is_issued_not_spawned()
+                            && !self.browser_issues.get(turn).is_some_and(|issue| {
+                                matches!(
+                                    issue.cancellation,
+                                    Some(BrowserIssueCancellation::Clean { .. })
+                                )
+                            })))
+                    .then_some(*turn)
+                })
+                .collect();
+            let attached = self
+                .agents
+                .iter()
+                .filter_map(|(agent, row)| row.attached.then_some(*agent))
+                .collect();
+            self.closing
+                .as_mut()
+                .expect("checked closing session")
+                .complete_resources(managed, attached);
+        }
+        if matches!(
+            entry.record,
+            Record::ClosingTime {
+                phase: dudes_proto::ClosingPhase::Announced
+            }
+        ) && self
+            .closing
+            .as_ref()
+            .is_none_or(crate::closing::ClosingSession::is_complete)
+        {
+            self.closing = Some(crate::closing::ClosingSession::capture(self, lsn, entry.at));
+        } else if let Some(closing) = self.closing.as_mut() {
+            closing.fold(lsn, entry);
+        }
+        match &entry.record {
+            Record::ConversationDispatchUncertain {
+                agent,
+                turn,
+                dispatch_intent_lsn,
+                ..
+            } => {
+                if let Some(issue) = self.browser_issues.get_mut(turn)
+                    && issue.agent == *agent
+                    && issue.goal.is_none()
+                    && issue.spawn_lsn.is_none()
+                    && issue.end_lsn.is_none()
+                    && issue.dispatch_intents.last() == Some(dispatch_intent_lsn)
+                    && !issue.uncertain_dispatches.contains(dispatch_intent_lsn)
+                {
+                    issue.uncertain_dispatches.push(*dispatch_intent_lsn);
+                }
+            }
+            Record::ConversationContextResetQueued {
+                agent,
+                text,
+                context_lsn,
+                context_reset_turn,
+                ..
+            } => {
+                if self.conversation_context_loss(*agent) == Some(*context_reset_turn)
+                    && self.agents.get(agent).is_some_and(|row| {
+                        row.goal.is_none()
+                            && !row.retired
+                            && !row.attached
+                            && row.context_lsn == *context_lsn
+                    })
+                {
+                    self.unconfirmed_resumes.remove(agent);
+                    self.browser_notes.insert(
+                        lsn,
+                        BrowserNoteRow {
+                            agent: *agent,
+                            text: text.clone(),
+                            task: None,
+                            answer_to: None,
+                            destination: BrowserNoteDestination::ManagedConversation {
+                                context_lsn: *context_lsn,
+                            },
+                            state: BrowserNoteState::Queued,
+                        },
+                    );
+                }
+            }
+            Record::ConversationQuestion {
+                agent,
+                origin,
+                text,
+            } => {
+                let valid = self.agents.get(agent).is_some_and(|row| {
+                    row.open_turn == Some(origin.turn) && !row.retired && !row.attached
+                }) && self.conversation_question_origin(origin.turn) == Some(*origin);
+                if valid && let Some(row) = self.agents.get_mut(agent) {
+                    row.open_question = Some(text.clone());
+                    row.question_lsn = Some(lsn);
+                    row.conversation_question = Some(*origin);
+                }
+            }
+            Record::ConversationAnswerQueued {
+                agent,
+                question_lsn,
+                origin,
+                text,
+                task,
+                authority,
+                ..
+            } => {
+                let Some(row) = self.agents.get_mut(agent) else {
+                    return;
+                };
+                if row.question_lsn != Some(*question_lsn)
+                    || row.conversation_question != Some(*origin)
+                    || row.open_question.as_ref().is_none_or(|question| {
+                        dudes_proto::conversation_answer_task(question, text) != *task
+                    })
+                    || matches!(authority, dudes_proto::ConversationAnswerAuthority::Browser { browser } if browser.question_lsn != *question_lsn)
+                    || dudes_proto::normalized_chat_text(text) != Some(text.as_str())
+                {
+                    return;
+                }
+                row.open_question = None;
+                row.question_lsn = None;
+                row.conversation_question = None;
+                self.browser_notes.insert(
+                    lsn,
+                    BrowserNoteRow {
+                        agent: *agent,
+                        text: text.clone(),
+                        task: Some(task.clone()),
+                        answer_to: Some(*question_lsn),
+                        destination: BrowserNoteDestination::ManagedConversation {
+                            context_lsn: origin.context_lsn,
+                        },
+                        state: BrowserNoteState::Queued,
+                    },
+                );
+            }
+            Record::ConversationMessageQueued {
+                agent,
+                text,
+                browser: _,
+                context_lsn,
+                ..
+            } => {
+                if self.conversation_context_loss(*agent).is_none()
+                    && self.agents.get(agent).is_some_and(|row| {
+                        row.goal.is_none()
+                            && !row.retired
+                            && !row.attached
+                            && row.context_lsn == *context_lsn
+                    })
+                {
+                    self.browser_notes
+                        .entry(lsn)
+                        .or_insert_with(|| BrowserNoteRow {
+                            agent: *agent,
+                            text: text.clone(),
+                            task: None,
+                            answer_to: None,
+                            destination: BrowserNoteDestination::ManagedConversation {
+                                context_lsn: *context_lsn,
+                            },
+                            state: BrowserNoteState::Queued,
+                        });
+                }
+            }
+            Record::ConversationTurnDecided {
+                input_digest,
+                agent,
+                note_lsn,
+                context_lsn,
+                decision,
+                ..
+            } => {
+                if self
+                    .conversation_message(*agent, *note_lsn, *context_lsn)
+                    .is_some()
+                    && !matches!(decision, NoteAdmission::Issue { task } if self.browser_notes[note_lsn].task.as_deref().unwrap_or(&self.browser_notes[note_lsn].text) != task)
+                {
+                    self.conversation_decisions.insert(
+                        *agent,
+                        (
+                            lsn,
+                            *note_lsn,
+                            *context_lsn,
+                            decision.clone(),
+                            input_digest.clone(),
+                        ),
+                    );
+                }
+            }
+            Record::ConversationTurnIssued {
+                agent,
+                turn,
+                note_lsn,
+                context_lsn,
+                task,
+                session,
+                model_selection,
+                lsn_of_decision,
+                ..
+            } => {
+                let admitted = self.conversation_message(*agent, *note_lsn, *context_lsn).is_some_and(|note| note.task.as_deref().unwrap_or(&note.text) == task)
+                    && self.eligible_browser_note(*agent, &BrowserNoteDestination::ManagedConversation { context_lsn: *context_lsn }).is_some_and(|(next, _)| next == *note_lsn)
+                    && self.agents.get(agent).is_some_and(|row| row.open_turn.is_none())
+                    && self.conversation_decisions.get(agent).is_some_and(|(at, note, context, decision, _)|
+                        *at == *lsn_of_decision && *note == *note_lsn && *context == *context_lsn && matches!(decision, NoteAdmission::Issue { task: issued } if issued == task));
+                if admitted && !self.turns.contains_key(turn) {
+                    self.browser_notes
+                        .get_mut(note_lsn)
+                        .expect("validated message")
+                        .state = BrowserNoteState::Reserved { turn: *turn };
+                    self.install_browser_turn(
+                        *turn,
+                        BrowserIssueRow {
+                            agent: *agent,
+                            note_lsn: *note_lsn,
+                            issue_lsn: lsn,
+                            goal: None,
+                            note_only: false,
+                            completion_lsn: None,
+                            contract: None,
+                            dispatch_intents: Vec::new(),
+                            uncertain_dispatches: Vec::new(),
+                            spawn_lsn: None,
+                            reissued: false,
+                            end_lsn: None,
+                            cancellation: None,
+                        },
+                        task,
+                        session.as_ref(),
+                        model_selection,
+                        &[],
+                    );
+                }
+            }
+            Record::BrowserNoteQueued {
+                agent,
+                text,
+                browser: _,
+                destination,
+            } => {
+                if matches!(
+                    destination,
+                    BrowserNoteDestination::ManagedConversation { .. }
+                ) {
+                    return;
+                }
+                self.browser_notes
+                    .entry(lsn)
+                    .or_insert_with(|| BrowserNoteRow {
+                        agent: *agent,
+                        text: text.clone(),
+                        task: None,
+                        answer_to: None,
+                        destination: destination.clone(),
+                        state: BrowserNoteState::Queued,
+                    });
+            }
+            Record::BrowserNoteCancelled {
+                agent, note_lsn, ..
+            } => {
+                if let Some(note) = self.browser_notes.get_mut(note_lsn)
+                    && note.agent == *agent
+                    && note.state == BrowserNoteState::Queued
+                {
+                    note.state = BrowserNoteState::Cancelled;
+                }
+            }
+            Record::NoteTurnDecided {
+                agent,
+                goal,
+                note_lsn,
+                completion_lsn,
+                input_digest,
+                gate_trace,
+                decision,
+            }
+            | Record::TaughtNoteTurnDecided {
+                agent,
+                goal,
+                note_lsn,
+                completion_lsn,
+                input_digest,
+                gate_trace,
+                decision,
+            } => {
+                let contract = if matches!(entry.record, Record::TaughtNoteTurnDecided { .. }) {
+                    NoteContract::Taught
+                } else {
+                    NoteContract::Raw
+                };
+                let taught_valid=contract==NoteContract::Raw || (dudes_proto::valid_taught_decision(decision,gate_trace)
+                    && self.browser_notes.get(note_lsn).is_some_and(|note|
+                        !matches!(decision,NoteAdmission::Issue{task} if !contract.task_matches(&note.text,task))));
+                if taught_valid
+                    && self.completed_goal(*agent) == Some((*goal, *completion_lsn))
+                    && self.browser_notes.get(note_lsn).is_some_and(|note| {
+                        note.agent == *agent
+                            && note.state == BrowserNoteState::Queued
+                            && note.destination
+                                == (BrowserNoteDestination::ManagedGoal { goal: *goal })
+                    })
+                {
+                    self.note_decisions.insert(
+                        *agent,
+                        NoteDecisionRow {
+                            lsn,
+                            goal: *goal,
+                            note_lsn: *note_lsn,
+                            completion_lsn: *completion_lsn,
+                            input_digest: input_digest.clone(),
+                            gate_trace: gate_trace.clone(),
+                            decision: decision.clone(),
+                            contract,
+                        },
+                    );
+                }
+            }
+            Record::NoteOnlyTurnIssued { .. }
+            | Record::TaughtNoteOnlyTurnIssued { .. }
+            | Record::TurnIssuedWithBrowserNote { .. } => {
+                self.fold_browser_issue(lsn, &entry.record);
+            }
+            Record::BrowserNoteDispatchIntent {
+                agent,
+                note_lsn,
+                turn,
+            } => {
+                if let Some(issue) = self.browser_issues.get_mut(turn)
+                    && issue.agent == *agent
+                    && issue.note_lsn == *note_lsn
+                    && issue.cancellation.is_none()
+                    && issue.spawn_lsn.is_none()
+                    && issue.end_lsn.is_none()
+                {
+                    if issue.goal.is_none()
+                        && issue
+                            .dispatch_intents
+                            .last()
+                            .is_some_and(|prior| !issue.uncertain_dispatches.contains(prior))
+                    {
+                        return;
+                    }
+                    issue.dispatch_intents.push(lsn);
+                }
+            }
+            Record::BrowserNoteIssuedCancelled {
+                agent,
+                note_lsn,
+                turn,
+                ..
+            } => {
+                if let Some(issue) = self.browser_issues.get_mut(turn)
+                    && issue.agent == *agent
+                    && issue.note_lsn == *note_lsn
+                    && issue.goal.is_some()
+                    && issue.dispatch_intents.is_empty()
+                    && issue.spawn_lsn.is_none()
+                    && issue.end_lsn.is_none()
+                    && issue.cancellation.is_none()
+                {
+                    issue.cancellation = Some(BrowserIssueCancellation::Clean { lsn });
+                    if let Some(note) = self.browser_notes.get_mut(note_lsn) {
+                        note.state = BrowserNoteState::Cancelled;
+                    }
+                    if let Some(agent) = self.agents.get_mut(agent)
+                        && agent.open_turn == Some(*turn)
+                    {
+                        agent.open_turn = None;
+                    }
+                }
+            }
+            Record::BrowserNoteReissueCancelled {
+                agent,
+                note_lsn,
+                turn,
+                dispatch_intent_lsn,
+                ..
+            } => {
+                if let Some(issue) = self.browser_issues.get_mut(turn)
+                    && issue.agent == *agent
+                    && issue.note_lsn == *note_lsn
+                    && issue.goal.is_some()
+                    && issue.dispatch_intents.contains(dispatch_intent_lsn)
+                    && issue.spawn_lsn.is_none()
+                    && issue.end_lsn.is_none()
+                    && issue.cancellation.is_none()
+                {
+                    issue.cancellation = Some(BrowserIssueCancellation::Ambiguous {
+                        lsn,
+                        dispatch_intent_lsn: *dispatch_intent_lsn,
+                    });
+                    if let Some(note) = self.browser_notes.get_mut(note_lsn) {
+                        note.state = BrowserNoteState::ReissueCancelled { turn: *turn };
+                    }
+                }
+            }
+            Record::BrowserNoteContextEmitted { agent, note_lsn } => {
+                if let Some(note) = self.browser_notes.get_mut(note_lsn)
+                    && note.agent == *agent
+                    && note.destination == BrowserNoteDestination::AttachedContext
+                    && note.state == BrowserNoteState::Queued
+                {
+                    note.state = BrowserNoteState::ContextEmitted;
+                }
+            }
+            Record::AgentRenamed { id, name, .. } => {
+                if let Some(row) = self.agents.get_mut(id) {
+                    row.name.clone_from(name);
+                }
+            }
+            Record::AgentLookChanged {
+                id,
+                role,
+                character,
+                accent,
+                ..
+            } => {
+                if let Some(row) = self.agents.get_mut(id) {
+                    row.role.clone_from(role);
+                    row.character = *character;
+                    row.accent = *accent;
+                    row.look_lsn = Some(lsn);
+                }
+            }
+            Record::AgentMcpServersChanged { agent, mcp_servers } => {
+                if let Some(row) = self.agents.get_mut(agent) {
+                    row.mcp.replace(lsn, mcp_servers);
+                }
+            }
+            Record::McpLaunchGranted {
+                agent,
+                turn,
+                policy_lsn,
+                mcp_servers,
+            } => {
+                self.mcp_grants.insert(
+                    lsn,
+                    McpGrant {
+                        agent: *agent,
+                        turn: *turn,
+                        policy_lsn: *policy_lsn,
+                        mcp_servers: mcp_servers.clone(),
+                        spawned: None,
+                    },
+                );
+            }
+            Record::AgentHired {
+                id,
+                name,
+                role,
+                department,
+                provider,
+                character,
+                accent,
+                cwd,
+                budget,
+                sandbox,
+                isolation,
+                max_turns,
+                max_budget,
+                trusted,
+                worktree,
+                mcp_servers,
+                browser_onboarding,
+                ..
+            } => {
+                self.agents.insert(
+                    *id,
+                    AgentRow {
+                        name: name.clone(),
+                        role: role.clone(),
+                        look_lsn: None,
+                        department: department.clone(),
+                        provider: *provider,
+                        character: *character,
+                        accent: *accent,
+                        cwd: cwd.clone(),
+                        budget: *budget,
+                        sandbox: *sandbox,
+                        max_turns: *max_turns,
+                        max_budget: *max_budget,
+                        trusted: *trusted,
+                        worktree: *worktree,
+                        mcp: McpPolicy::hired(
+                            lsn,
+                            mcp_servers,
+                            *isolation,
+                            browser_onboarding.is_some(),
+                        ),
+                        retired: false,
+                        halted: false,
+                        paused: false,
+                        attached: false,
+                        control_lsn: None,
+                        automatic_hold: None,
+                        fast_failures: None,
+                        rapid_failure_beat: false,
+                        pending_launch_failure: None,
+                        open_question: None,
+                        question_lsn: None,
+                        conversation_question: None,
+                        pending_answers: VecDeque::new(),
+                        last_turn_end: None,
+                        goal: None,
+                        context_lsn: lsn,
+                        rung: BreakerRung::Healthy,
+                        steers: VecDeque::new(),
+                        session: None,
+                        open_turn: None,
+                        last_input_digest: None,
+                    },
+                );
+                if let Some(worktree) = worktree {
+                    self.assign_worktree(*worktree, *id);
+                }
+            }
+            Record::WorktreeLeased { .. } | Record::WorktreeRemoved { .. } => {
+                self.fold_worktree(&entry.record);
+            }
+            Record::AgentRetired { id, .. } => {
+                if let Some(row) = self.agents.get_mut(id) {
+                    row.retired = true;
+                    row.goal = None;
+                    row.context_lsn = lsn;
+                }
+                for (goal, row) in &mut self.goals {
+                    if !row.cleared
+                        && !self.completed_goals.contains_key(goal)
+                        && matches!(row.goal.predicate, Predicate::BoardState { .. })
+                    {
+                        row.predicate = None;
+                    }
+                }
+            }
+            Record::GoalSet { agent, goal, .. } => {
+                self.goals.insert(
+                    goal.id,
+                    GoalRow {
+                        goal: goal.clone(),
+                        agent: *agent,
+                        turns_on_goal: 0,
+                        predicate: None,
+                        last_turn: None,
+                        cleared: false,
+                    },
+                );
+                if let Some(row) = self.agents.get_mut(agent) {
+                    row.goal = Some(goal.id);
+                    row.context_lsn = lsn;
+                    row.automatic_hold = None;
+                    row.fast_failures = None;
+                    row.rapid_failure_beat = false;
+                    row.pending_launch_failure = None;
+                }
+            }
+            Record::GoalCleared { agent, goal } => {
+                if let Some(row) = self.goals.get_mut(goal) {
+                    row.cleared = true;
+                }
+                if let Some(row) = self.agents.get_mut(agent)
+                    && row.goal == Some(*goal)
+                {
+                    row.goal = None;
+                    row.context_lsn = lsn;
+                }
+            }
+            Record::GoalReassigned { goal, from, to, .. } => {
+                if let Some(row) = self.goals.get_mut(goal) {
+                    row.agent = *to;
+                }
+                if let Some(row) = self.agents.get_mut(from)
+                    && row.goal == Some(*goal)
+                {
+                    row.goal = None;
+                    row.context_lsn = lsn;
+                }
+                if let Some(row) = self.agents.get_mut(to) {
+                    row.goal = Some(*goal);
+                    row.context_lsn = lsn;
+                }
+            }
+            Record::TurnIssued {
+                agent,
+                turn,
+                goal,
+                task,
+                session,
+                model_selection,
+                lsn_of_decision,
+                answers,
+                ..
+            } => {
+                // a record that omits the agent's oldest pending answer, although that
+                // answer precedes its decision, predates `answers` — this build's carry always lists
+                // the oldest. An absent list is "not recorded", never "carried none",
+                // and the agent has worked past every answer decided before it: each
+                // is retired without delivery, its `HumanAnswer` still in the journal.
+                if let Some(row) = self.agents.get_mut(agent)
+                    && row.pending_answers.front().is_some_and(|oldest| {
+                        oldest.lsn < *lsn_of_decision && !answers.contains(&oldest.lsn)
+                    })
+                {
+                    row.pending_answers
+                        .retain(|pending| pending.lsn > *lsn_of_decision);
+                }
+                self.install_managed_turn(
+                    *turn,
+                    TurnRow {
+                        agent: *agent,
+                        goal: Some(*goal),
+                        status: TurnStatus::Issued,
+                        session: session.clone(),
+                        announced: session.clone(),
+                        session_confirmed: false,
+                        task: task.clone(),
+                        answers: answers.clone(),
+                        model_selection: model_selection.clone(),
+                        pid: None,
+                        start_time: None,
+                        boot: None,
+                        spawn_lsn: None,
+                        mcp_grant: None,
+                    },
+                );
+            }
+            Record::MailWakeTurnDecided(_) => {}
+            Record::MailWakeOnlyTurnIssued(issue) => {
+                if self.mail_wakes.accepted(lsn) {
+                    self.install_managed_turn(
+                        issue.turn,
+                        TurnRow {
+                            agent: issue.agent,
+                            goal: Some(issue.goal),
+                            status: TurnStatus::Issued,
+                            session: issue.session.clone(),
+                            announced: issue.session.clone(),
+                            session_confirmed: false,
+                            task: issue.task.as_str().to_owned(),
+                            answers: Vec::new(),
+                            model_selection: Some(issue.model_selection.clone()),
+                            pid: None,
+                            start_time: None,
+                            boot: None,
+                            spawn_lsn: None,
+                            mcp_grant: None,
+                        },
+                    );
+                }
+            }
+            Record::TurnSpawned {
+                agent,
+                turn,
+                pid,
+                start_time,
+                boot,
+                session,
+                reissued,
+                mcp_grant,
+            } => {
+                if self.browser_issues.get(turn).is_some_and(|issue| {
+                    matches!(
+                        issue.cancellation,
+                        Some(BrowserIssueCancellation::Clean { .. })
+                    )
+                }) {
+                    return;
+                }
+                if self
+                    .browser_issues
+                    .get(turn)
+                    .is_some_and(|issue| issue.agent != *agent || issue.dispatch_intents.is_empty())
+                {
+                    return;
+                }
+                if let Some(issue) = self.browser_issues.get_mut(turn)
+                    && issue.agent == *agent
+                {
+                    issue.spawn_lsn = Some(lsn);
+                    issue.reissued = *reissued;
+                    if let Some(note) = self.browser_notes.get_mut(&issue.note_lsn) {
+                        note.state = BrowserNoteState::Delivered { turn: *turn };
+                    }
+                }
+                if let Some(row) = self.turns.get_mut(turn) {
+                    row.status = TurnStatus::Spawned;
+                    row.pid = Some(*pid);
+                    row.start_time = Some(*start_time);
+                    row.boot.clone_from(boot);
+                    row.spawn_lsn = Some(lsn);
+                    row.mcp_grant = *mcp_grant;
+                    if session.is_some() {
+                        row.session.clone_from(session);
+                    }
+                    row.announced.clone_from(session);
+                    // Any confirmation already folded for this TurnId belongs to an earlier
+                    // launch attempt. The machine journals the current reissue's held confirmation
+                    // only after this carrier is durable.
+                    if *reissued {
+                        row.session_confirmed = false;
+                    }
+                }
+                if let Some(grant) = mcp_grant.and_then(|grant| self.mcp_grants.get_mut(&grant)) {
+                    grant.spawned = Some((
+                        lsn,
+                        AdoptionKey {
+                            pid: *pid,
+                            start_time: *start_time,
+                            boot: boot.clone(),
+                        },
+                    ));
+                }
+                if *reissued && let Some(row) = self.agents.get_mut(agent) {
+                    row.session = None;
+                    if self
+                        .browser_issues
+                        .get(turn)
+                        .is_some_and(|issue| issue.goal.is_none())
+                    {
+                        row.context_lsn = lsn;
+                    }
+                }
+                // The consumption point: the answers this turn's task carries are
+                // delivered now that a child exists, and not before.
+                let carried = self
+                    .turns
+                    .get(turn)
+                    .map(|row| row.answers.clone())
+                    .unwrap_or_default();
+                if !carried.is_empty()
+                    && let Some(row) = self.agents.get_mut(agent)
+                {
+                    row.pending_answers
+                        .retain(|pending| !carried.contains(&pending.lsn));
+                }
+            }
+            Record::SessionLearned {
+                agent,
+                turn,
+                session,
+            } => {
+                if let Some(row) = self.turns.get_mut(turn) {
+                    row.session = Some(session.clone());
+                    row.session_confirmed = true;
+                }
+                if let Some(row) = self.agents.get_mut(agent) {
+                    row.session = Some(session.clone());
+                }
+                self.unconfirmed_resumes.remove(agent);
+            }
+            Record::TurnEnded {
+                agent,
+                turn,
+                mode,
+                provenance,
+                outcome,
+                session,
+                usage,
+                session_usage,
+                elapsed_ms,
+                exit,
+                model_usage,
+                ..
+            } => {
+                if self.browser_issues.get(turn).is_some_and(|issue| {
+                    matches!(
+                        issue.cancellation,
+                        Some(BrowserIssueCancellation::Clean { .. })
+                    )
+                }) {
+                    return;
+                }
+                if let Some(issue) = self.browser_issues.get_mut(turn)
+                    && issue.agent == *agent
+                {
+                    issue.end_lsn = Some(lsn);
+                    if let Some(note) = self.browser_notes.get_mut(&issue.note_lsn) {
+                        note.state = if issue.spawn_lsn.is_none() {
+                            BrowserNoteState::Failed { turn: *turn }
+                        } else {
+                            BrowserNoteState::Delivered { turn: *turn }
+                        };
+                    }
+                }
+                let current_goal_end = self.turns.get(turn).is_some_and(|turn_row| {
+                    self.agents
+                        .get(agent)
+                        .is_some_and(|row| row.goal == turn_row.goal)
+                });
+                let qualifies = *mode == dudes_types::Mode::Managed
+                    && *provenance == Provenance::Observed
+                    && exit.code.is_some_and(|code| code != 0)
+                    && elapsed_ms.is_some_and(|elapsed| elapsed <= 5_000)
+                    && !matches!(
+                        outcome,
+                        Some(
+                            TurnOutcome::Killed { .. }
+                                | TurnOutcome::NotLaunched { .. }
+                                | TurnOutcome::LaunchRefused { .. }
+                        )
+                    )
+                    && usage.as_ref().is_none_or(no_positive_usage)
+                    && model_usage.values().all(no_positive_usage);
+                if current_goal_end && let Some(row) = self.agents.get_mut(agent) {
+                    row.pending_launch_failure = match outcome {
+                        Some(TurnOutcome::NotLaunched { reason }) => {
+                            Some(dudes_proto::AutomaticHold::LaunchFailed {
+                                reason: launch_failed_reason(reason),
+                            })
+                        }
+                        Some(TurnOutcome::LaunchRefused { reason }) => {
+                            Some(dudes_proto::AutomaticHold::LaunchRefused {
+                                reason: reason.clone(),
+                            })
+                        }
+                        _ => None,
+                    };
+                    row.fast_failures = if qualifies {
+                        Some((row.fast_failures.map_or(*turn, |(first, _)| first), *turn))
+                    } else {
+                        None
+                    };
+                    if !qualifies {
+                        row.rapid_failure_beat = false;
+                    }
+                }
+                let confirmed = self
+                    .turns
+                    .get(turn)
+                    .is_some_and(|row| row.session_confirmed);
+                if let (true, Some(session)) = (confirmed, session) {
+                    let total = self.session_totals.entry(session.clone()).or_default();
+                    match (session_usage, usage) {
+                        (Some(recorded), _) => *total = *recorded,
+                        // A record written before the running total was recorded carries none, so the sum
+                        // of its charges stands in for one.
+                        (None, Some(usage)) => *total = total.saturating_add(*usage),
+                        (None, None) => {}
+                    }
+                }
+                let invalidates_resume = *mode == dudes_types::Mode::Managed
+                    && qualifying_unconfirmed_resume_end(outcome.as_ref())
+                    && self.turns.get(turn).is_some_and(|turn_row| {
+                        !turn_row.session_confirmed
+                            && turn_row.session.as_ref().is_some_and(|announced| {
+                                self.agents
+                                    .get(agent)
+                                    .and_then(|agent_row| agent_row.session.as_ref())
+                                    == Some(announced)
+                            })
+                    });
+                if let Some(row) = self.turns.get_mut(turn) {
+                    row.status = if matches!(outcome, Some(dudes_proto::TurnOutcome::Killed { .. }))
+                    {
+                        TurnStatus::Killed
+                    } else {
+                        TurnStatus::Ended
+                    };
+                    if session.is_some() {
+                        row.session.clone_from(session);
+                    }
+                }
+                if let Some(row) = self.agents.get_mut(agent) {
+                    // Last write by `lsn` wins, which is what makes an Observed superseder of an
+                    // Inferred end work when an emitter of one ever exists.
+                    row.last_turn_end = Some(*provenance);
+                    if row.open_turn == Some(*turn) {
+                        row.open_turn = None;
+                    }
+                    if invalidates_resume
+                        || matches!(
+                            outcome,
+                            Some(dudes_proto::TurnOutcome::LaunchRefused { .. })
+                        )
+                    {
+                        row.session = None;
+                    }
+                }
+                if invalidates_resume {
+                    self.unconfirmed_resumes.insert(*agent, *turn);
+                    if self
+                        .browser_issues
+                        .get(turn)
+                        .is_some_and(|issue| issue.goal.is_none())
+                        && let Some(row) = self.agents.get_mut(agent)
+                    {
+                        row.context_lsn = lsn;
+                    }
+                }
+            }
+            // The effective pass is the recorded one AND the eligibility check, so a
+            // passing result an older runner journaled for a sibling's status cannot finish a goal
+            // after a restart.
+            Record::PredicateResult {
+                goal,
+                provenance,
+                pass,
+                evidence,
+                ..
+            } => {
+                if let Some(row) = self.goals.get_mut(goal) {
+                    row.predicate = Some(PredicateInput {
+                        pass: *pass
+                            && crate::predicate_evidence_eligible(&row.goal.predicate, evidence),
+                        provenance: *provenance,
+                        not_run: evidence.not_run(*pass),
+                    });
+                }
+            }
+            Record::BreakerBeat {
+                agent,
+                rung_after,
+                signals,
+                ..
+            } => {
+                if let Some(row) = self.agents.get_mut(agent) {
+                    row.rung = *rung_after;
+                    if signals.contains(&dudes_types::BreakerSignal::RapidFailure) {
+                        row.rapid_failure_beat = true;
+                    }
+                }
+            }
+            Record::HumanQuestion { agent, text } => {
+                if let Some(row) = self.agents.get_mut(agent) {
+                    row.open_question = Some(text.clone());
+                    row.question_lsn = Some(lsn);
+                    row.conversation_question = None;
+                }
+            }
+            // An answer closes the open question and waits to be carried by the next spawned
+            // turn. One that finds no open question is inert, and so is one appended while the
+            // agent is attached: the question closes, and nothing is delivered, because the human
+            // holds the keyboard.
+            Record::HumanAnswer { agent, text, .. } => {
+                if let Some(row) = self.agents.get_mut(agent)
+                    && let Some(question) = row.open_question.take()
+                {
+                    row.question_lsn = None;
+                    row.conversation_question = None;
+                    if !row.attached {
+                        row.pending_answers.push_back(PendingAnswer {
+                            lsn,
+                            question,
+                            text: text.clone(),
+                        });
+                    }
+                }
+            }
+            Record::Attached { agent, .. } => {
+                if let Some(row) = self.agents.get_mut(agent) {
+                    row.attached = true;
+                }
+            }
+            Record::Detached { agent, .. } => {
+                if let Some(row) = self.agents.get_mut(agent) {
+                    row.attached = false;
+                }
+                self.attached_children.remove(agent);
+            }
+            Record::PtySpawned {
+                agent,
+                pty: _,
+                pid,
+                start_time,
+                boot,
+            } => {
+                if self.agents.get(agent).is_some_and(|row| row.attached) {
+                    self.attached_children.insert(
+                        *agent,
+                        AdoptionKey {
+                            pid: *pid,
+                            start_time: *start_time,
+                            boot: boot.clone(),
+                        },
+                    );
+                }
+            }
+            // Append only. The cap is the producer's (see [`MAX_PENDING_STEERS`]), so there is
+            // no eviction arm here and no branch on depth — which is what makes this fold a pure
+            // function of the record sequence, identical live and on replay.
+            Record::Steer { agent, text, .. } => {
+                if let Some(row) = self.agents.get_mut(agent) {
+                    row.steers.push_back((lsn, text.clone()));
+                }
+            }
+            // Delivered, or dropped undelivered. Both remove the note **at that position** and
+            // remove nothing when the queue does not hold it, so both are idempotent: replaying a
+            // journal that already folded once reaches the same queue, and a removal that races a
+            // second event cannot take a different note than the one it named.
+            Record::SteerConsumed { agent, steer_lsn }
+            | Record::SteerCleared { agent, steer_lsn } => {
+                if let Some(row) = self.agents.get_mut(agent) {
+                    row.steers.retain(|(at, _)| at != steer_lsn);
+                }
+            }
+            Record::AgentHeld { agent, cause, .. } => {
+                if let Some(row) = self.agents.get_mut(agent) {
+                    row.automatic_hold = Some(cause.clone());
+                    row.pending_launch_failure = None;
+                    row.control_lsn = Some(lsn);
+                }
+            }
+            Record::Halt { agent, .. } => {
+                if let Some(row) = self.agents.get_mut(agent) {
+                    row.halted = true;
+                    row.control_lsn = Some(lsn);
+                }
+            }
+            Record::Pause { agent, .. } => {
+                if let Some(row) = self.agents.get_mut(agent) {
+                    row.paused = true;
+                    row.control_lsn = Some(lsn);
+                }
+            }
+            Record::Resume { agent, .. } => {
+                if let Some(row) = self.agents.get_mut(agent) {
+                    row.automatic_hold = None;
+                    row.fast_failures = None;
+                    row.rapid_failure_beat = false;
+                    row.pending_launch_failure = None;
+                    row.halted = false;
+                    row.paused = false;
+                    row.control_lsn = Some(lsn);
+                }
+            }
+            Record::HookTokenMinted { agent, token_hash } => {
+                // Insert, never replace: a draw for an agent adds a member rather than superseding
+                // what that agent already has, which is set membership.
+                //
+                // This map is not itself the valid set — it holds every hash ever minted, a
+                // retired agent's included. The valid set is what `agent_for_token_hash` answers
+                // over it, once retirement is applied there. Half the rule is folded here; the
+                // other half is read, and neither is the whole.
+                //
+                // `or_insert` rather than `insert` decides the one case the machine cannot
+                // produce — the same hash journaled twice for two different agents, which needs a
+                // blake3 collision or a hand-written journal. First writer wins there, so a later
+                // record cannot repoint a credential a child is already holding. Nothing tests
+                // it because nothing can reach it; it is a choice made rather than left to the
+                // last line of a corrupt log.
+                self.minted.entry(token_hash.clone()).or_insert(*agent);
+            }
+            Record::LoopDecided {
+                agent,
+                input_digest,
+                decision,
+                ..
+            } => {
+                // The digest is the trace `dudes why` prints and also what the tick's sweep
+                // compares an `Exhausted` agent's current input against.
+                //
+                // **Assignment, and never `or_insert`.** The `HookTokenMinted` arm two above is
+                // set-membership under a first-writer-wins rule, and this arm is the opposite
+                // shape: the field is the *most recent* decision's digest, so a `.entry().or_*`
+                // here would freeze it on the first decision an agent ever took, every later
+                // input change would compare equal, and the agent would stay `Exhausted` for
+                // ever — the exact defect this record closes, restored by copying a neighbour.
+                if matches!(decision, LoopDecision::Continue { .. })
+                    && let Some(goal) = self.agents.get(agent).and_then(|row| row.goal)
+                {
+                    self.ordinary_continues.insert(lsn, (*agent, goal));
+                }
+                if let Some(row) = self.agents.get_mut(agent) {
+                    row.last_input_digest = Some(input_digest.clone());
+                    if matches!(decision, LoopDecision::Done)
+                        && let Some(goal) = row.goal
+                    {
+                        self.completed_goals.entry(goal).or_insert(lsn);
+                    }
+                }
+            }
+            // A refusal (the only kind there is) and a no-op on purpose, not for
+            // want of a reader: every value on it is already a projection of other records. The
+            // spend is the budget projection's, the ceilings are `agent.hire`'s and `goal.set`'s,
+            // and the `Exhausted` status is moved by the `LoopDecided` written beside it — which
+            // is the arm directly above, now that it has a reader of its own. Folding any of it
+            // here would give one fact two owners.
+            Record::BudgetDecision { .. } => {} // history, read from the journal
+            Record::MemoryCondenseModelAdmitted { .. } => {} // history, read from the journal
+            Record::CardCreated { card, .. }
+            | Record::CardTransition { card, .. }
+            | Record::Claim { card, .. } => {
+                for (goal, row) in &mut self.goals {
+                    if !row.cleared
+                        && !self.completed_goals.contains_key(goal)
+                        && matches!(row.goal.predicate, Predicate::BoardState {
+                            card: requested, ..
+                        } if requested == *card)
+                    {
+                        row.predicate = None;
+                    }
+                }
+            }
+            Record::Mail { .. } | Record::MailState { .. } => {} // the mailbox's
+            Record::MemoryAppend { .. } | Record::MemoryCondense { .. } => {} // the memory projection's
+            Record::ConditionedEffectSuppressed { .. } | Record::MemoryAppendQuarantined { .. } => {
+            } // conditioned-effect audit records
+            // **A no-op is what makes replay safe here, not an omission.** A `pty.write` exists
+            // only as the continuation of the call that made it: the bytes reach the host from the
+            // router's connection thread, and the connection that owned the `PtyId` is gone by the
+            // time anything replays. Folding a request into pending work would be the one way to
+            // turn the "replay never replays bytes for an unmatched request" guarantee false —
+            // a restarted daemon re-issuing a write nobody asked for twice.
+            Record::PtyWriteRequested { .. }
+            | Record::PtyWriteCompleted { .. }
+            | Record::PtyCloseRequested { .. }
+            | Record::PtyCloseCompleted { .. } => {}
+            // The retry loop is in memory, and so is the once-per-cause guard in front of it: a
+            // fold that re-derived "already deferred" from this record would have to survive a
+            // restart, and the next run re-asks rather than inheriting an answer.
+            Record::KillDeferred { .. } => {}
+            Record::ClosingTime { .. } => {}
+            Record::LiveActivityObserved { .. } => {}
+            Record::Checkpoint { .. } => {} // the writer's own record
+        }
+    }
+
+    /// The durable ordinary completion of the agent's current uncleared goal.
+    #[must_use]
+    pub fn completed_goal(&self, agent: AgentId) -> Option<(GoalId, Lsn)> {
+        let goal = self.agents.get(&agent)?.goal?;
+        if self.goals.get(&goal)?.cleared {
+            return None;
+        }
+        self.completed_goal_lsn(goal).map(|lsn| (goal, lsn))
+    }
+
+    /// The first durable ordinary Done for this goal.
+    #[must_use]
+    pub fn completed_goal_lsn(&self, goal: GoalId) -> Option<Lsn> {
+        self.completed_goals.get(&goal).copied()
+    }
+
+    /// A browser note by its original queue identity.
+    #[must_use]
+    pub fn browser_note(&self, note_lsn: Lsn) -> Option<&BrowserNoteRow> {
+        self.browser_notes.get(&note_lsn)
+    }
+
+    /// Browser note identities in journal order, including durable dispositions.
+    #[must_use]
+    pub fn browser_notes(&self) -> &BTreeMap<Lsn, BrowserNoteRow> {
+        &self.browser_notes
+    }
+
+    /// Oldest queued browser note with exactly this owner and destination.
+    #[must_use]
+    pub fn eligible_browser_note(
+        &self,
+        agent: AgentId,
+        destination: &BrowserNoteDestination,
+    ) -> Option<(Lsn, &BrowserNoteRow)> {
+        self.browser_notes
+            .iter()
+            .filter(|(_, note)| {
+                note.agent == agent
+                    && note.state == BrowserNoteState::Queued
+                    && &note.destination == destination
+            })
+            .min_by_key(|(lsn, note)| (note.answer_to.is_none(), **lsn))
+            .map(|(lsn, note)| (*lsn, note))
+    }
+
+    /// All durable dispatch attempts and dispositions of a note-bearing turn.
+    #[must_use]
+    pub fn browser_issue(&self, turn: TurnId) -> Option<&BrowserIssueRow> {
+        self.browser_issues.get(&turn)
+    }
+
+    /// Whether durable cancellation forbids every future dispatch of this turn.
+    #[must_use]
+    pub fn browser_issue_cancelled(&self, turn: TurnId) -> bool {
+        self.browser_issues
+            .get(&turn)
+            .is_some_and(|issue| issue.cancellation.is_some())
+    }
+
+    /// Latest completed-note admission, separate from the ordinary goal digest.
+    #[must_use]
+    pub fn note_admission(&self, agent: AgentId) -> Option<&NoteDecisionRow> {
+        self.note_decisions.get(&agent)
+    }
+
+    #[must_use]
+    pub(crate) fn conversation_question_origin(
+        &self,
+        turn: TurnId,
+    ) -> Option<dudes_proto::ConversationQuestionOrigin> {
+        let issue = self.browser_issues.get(&turn)?;
+        let executed = self.turns.get(&turn)?;
+        if issue.goal.is_some()
+            || executed.agent != issue.agent
+            || executed.goal.is_some()
+            || !executed.is_open_child()
+        {
+            return None;
+        }
+        let context_lsn = if issue.reissued {
+            issue.spawn_lsn?
+        } else {
+            let BrowserNoteDestination::ManagedConversation { context_lsn } =
+                self.browser_notes.get(&issue.note_lsn)?.destination
+            else {
+                return None;
+            };
+            context_lsn
+        };
+        Some(dudes_proto::ConversationQuestionOrigin { turn, context_lsn })
+    }
+
+    /// Exact finite turn whose vendor context requires explicit acknowledgement before new work.
+    #[must_use]
+    pub fn conversation_context_loss(&self, agent: AgentId) -> Option<TurnId> {
+        let turn = self.unconfirmed_resumes.get(&agent)?;
+        self.browser_issues
+            .get(turn)
+            .filter(|issue| issue.goal.is_none())
+            .map(|_| *turn)
+    }
+
+    /// Latest finite admission digest, separate from the ordinary goal loop.
+    #[must_use]
+    pub fn conversation_input_digest(&self, agent: AgentId) -> Option<&str> {
+        self.conversation_decisions
+            .get(&agent)
+            .map(|(_, _, _, _, digest)| digest.as_str())
+    }
+
+    /// An unissued message whose captured context is still current.
+    #[must_use]
+    pub fn conversation_message(
+        &self,
+        agent: AgentId,
+        note_lsn: Lsn,
+        context_lsn: Lsn,
+    ) -> Option<&BrowserNoteRow> {
+        let row = self.agents.get(&agent)?;
+        let note = self.browser_notes.get(&note_lsn)?;
+        (row.goal.is_none()
+            && row.context_lsn == context_lsn
+            && !row.attached
+            && !row.retired
+            && note.agent == agent
+            && note.state == BrowserNoteState::Queued
+            && note.destination == (BrowserNoteDestination::ManagedConversation { context_lsn }))
+        .then_some(note)
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one contract-qualified lifecycle join validates ownership before installing and charging the turn"
+    )]
+    fn fold_browser_issue(&mut self, lsn: Lsn, record: &Record) {
+        let (agent, turn, goal, task, session, selection, decision, answers, note_lsn, completion) =
+            match record {
+                Record::NoteOnlyTurnIssued {
+                    agent,
+                    turn,
+                    goal,
+                    task,
+                    session,
+                    model_selection,
+                    lsn_of_decision,
+                    answers,
+                    note_lsn,
+                    completion_lsn,
+                    ..
+                }
+                | Record::TaughtNoteOnlyTurnIssued {
+                    agent,
+                    turn,
+                    goal,
+                    task,
+                    session,
+                    model_selection,
+                    lsn_of_decision,
+                    answers,
+                    note_lsn,
+                    completion_lsn,
+                    ..
+                } => (
+                    *agent,
+                    *turn,
+                    *goal,
+                    task,
+                    session,
+                    model_selection,
+                    *lsn_of_decision,
+                    answers,
+                    *note_lsn,
+                    Some(*completion_lsn),
+                ),
+                Record::TurnIssuedWithBrowserNote {
+                    agent,
+                    turn,
+                    goal,
+                    task,
+                    session,
+                    model_selection,
+                    lsn_of_decision,
+                    answers,
+                    note_lsn,
+                    ..
+                } => (
+                    *agent,
+                    *turn,
+                    *goal,
+                    task,
+                    session,
+                    model_selection,
+                    *lsn_of_decision,
+                    answers,
+                    *note_lsn,
+                    None,
+                ),
+                _ => return,
+            };
+        let contract = match record {
+            Record::NoteOnlyTurnIssued { .. } => Some(NoteContract::Raw),
+            Record::TaughtNoteOnlyTurnIssued {
+                mode: dudes_types::Mode::Managed,
+                ..
+            } => Some(NoteContract::Taught),
+            Record::TaughtNoteOnlyTurnIssued { .. } => return,
+            _ => None,
+        };
+        if self.turns.contains_key(&turn) || self.browser_issues.contains_key(&turn) {
+            return;
+        }
+        let Some(note) = self.browser_notes.get_mut(&note_lsn) else {
+            return;
+        };
+        if note.agent != agent
+            || note.state != BrowserNoteState::Queued
+            || note.destination != (BrowserNoteDestination::ManagedGoal { goal })
+            || self.agents.get(&agent).is_none_or(|row| {
+                row.goal != Some(goal) || row.attached || row.retired || row.open_turn.is_some()
+            })
+            || self.goals.get(&goal).is_none_or(|row| row.cleared)
+        {
+            return;
+        }
+        let admitted = match completion {
+            Some(done) => answers.is_empty() && contract.is_some_and(|kind| kind.task_matches(&note.text,task)) && self.completed_goals.get(&goal) == Some(&done)
+                && self.note_decisions.get(&agent).is_some_and(|row| row.lsn == decision && row.note_lsn == note_lsn && row.goal == goal
+                    && row.completion_lsn == done && Some(row.contract)==contract && matches!(&row.decision, NoteAdmission::Issue { task: issued } if issued == task)),
+            None => !self.completed_goals.contains_key(&goal) && self.ordinary_continues.get(&decision) == Some(&(agent, goal)),
+        };
+        if !admitted {
+            return;
+        }
+        note.state = BrowserNoteState::Reserved { turn };
+        self.install_browser_turn(
+            turn,
+            BrowserIssueRow {
+                agent,
+                note_lsn,
+                issue_lsn: lsn,
+                goal: Some(goal),
+                note_only: completion.is_some(),
+                completion_lsn: completion,
+                contract,
+                dispatch_intents: Vec::new(),
+                uncertain_dispatches: Vec::new(),
+                spawn_lsn: None,
+                reissued: false,
+                end_lsn: None,
+                cancellation: None,
+            },
+            task,
+            session.as_ref(),
+            selection,
+            answers,
+        );
+    }
+
+    fn install_browser_turn(
+        &mut self,
+        turn: TurnId,
+        issue: BrowserIssueRow,
+        task: &str,
+        session: Option<&SessionId>,
+        selection: &ModelSelection,
+        answers: &[Lsn],
+    ) {
+        let agent = issue.agent;
+        let goal = issue.goal;
+        self.browser_issues.insert(turn, issue);
+        self.install_managed_turn(
+            turn,
+            TurnRow {
+                agent,
+                goal,
+                status: TurnStatus::Issued,
+                session: session.cloned(),
+                announced: session.cloned(),
+                session_confirmed: false,
+                task: task.to_owned(),
+                answers: answers.to_vec(),
+                model_selection: Some(selection.clone()),
+                pid: None,
+                start_time: None,
+                boot: None,
+                spawn_lsn: None,
+                mcp_grant: None,
+            },
+        );
+    }
+
+    fn install_managed_turn(&mut self, turn: TurnId, issued: TurnRow) {
+        let agent = issued.agent;
+        let goal = issued.goal;
+        self.turns.insert(turn, issued);
+        if let Some(row) = goal.and_then(|goal| self.goals.get_mut(&goal)) {
+            row.turns_on_goal = row.turns_on_goal.saturating_add(1);
+            row.last_turn = Some(turn);
+        }
+        if let Some(row) = self.agents.get_mut(&agent) {
+            row.open_turn = Some(turn);
+        }
+    }
+
+    pub(crate) fn mail_wake_state(
+        &self,
+        agent: AgentId,
+    ) -> Option<&dudes_proto::mail_wake::MailWakeState> {
+        self.mail_wakes.state(agent)
+    }
+    pub(crate) fn mail_wake_count(&self, agent: AgentId, day: dudes_types::UtcDay) -> u8 {
+        self.mail_wakes.count(agent, day)
+    }
+    pub(crate) fn mail_wake_receipts(
+        &self,
+        agent: AgentId,
+    ) -> Vec<dudes_proto::mail_wake::MailWakeMail> {
+        self.mail_wakes.receipts(agent)
+    }
+    pub(crate) fn mail_wake_recipients(&self, record: &Record) -> Vec<AgentId> {
+        self.mail_wakes.affected(record)
+    }
+    pub(crate) fn mail_wake_history_valid(&self) -> bool {
+        self.mail_wakes.valid()
+    }
+    pub(crate) fn mail_wake_origin(&self, turn: TurnId) -> bool {
+        self.mail_wakes.origin(turn)
+    }
+    pub(crate) fn mail_wake_entry_accepted(&self, lsn: Lsn) -> bool {
+        self.mail_wakes.accepted(lsn)
+    }
+
+    pub(crate) fn held_board_goals(
+        &self,
+        changed_card: Option<CardId>,
+    ) -> impl Iterator<Item = (AgentId, GoalId)> + '_ {
+        self.agents.iter().filter_map(move |(agent, row)| {
+            let goal = row.goal?;
+            let held = self.goals.get(&goal)?;
+            let Predicate::BoardState { card, .. } = held.goal.predicate else {
+                return None;
+            };
+            (!row.retired
+                && !held.cleared
+                && !self.completed_goals.contains_key(&goal)
+                && changed_card.is_none_or(|changed| card == changed))
+            .then_some((*agent, goal))
+        })
+    }
+
+    pub(crate) fn settled_status(&self, agent: AgentId) -> AgentStatus {
+        let Some(row) = self.agents.get(&agent) else {
+            return AgentStatus::Idle;
+        };
+        if row.attached {
+            AgentStatus::Attached
+        } else if row.open_question.is_some() {
+            AgentStatus::Waiting
+        } else if row.open_turn.is_some() {
+            AgentStatus::Running
+        } else if row
+            .goal
+            .is_some_and(|goal| self.completed_goals.contains_key(&goal))
+        {
+            AgentStatus::Done
+        } else {
+            AgentStatus::Idle
+        }
+    }
+
+    /// Everything one decision for one agent depends on, or `None` when the agent cannot be
+    /// decided for: it does not exist, it is retired, or its goal is absent, cleared or completed.
+    ///
+    /// An agent without a goal is not decided *at all* — no `LoopDecided`, no `Continue` on an
+    /// empty task. Gate 7 always fires, so inventing a goal would issue a turn with nothing in
+    /// it.
+    #[must_use]
+    pub fn loop_input(
+        &self,
+        agent: AgentId,
+        spend: SpendView,
+        work: WorkInput,
+        floor_usd_per_day: Option<Usd>,
+        per_turn_floor: dudes_proto::Spend,
+    ) -> Option<LoopInput> {
+        let row = self.agents.get(&agent)?;
+        if row.retired {
+            return None;
+        }
+        let goal_id = row.goal?;
+        let goal = self.goals.get(&goal_id)?;
+        if goal.cleared || self.completed_goals.contains_key(&goal_id) {
+            return None;
+        }
+        Some(LoopInput {
+            control: Control {
+                halted: row.halted,
+                paused: row.paused,
+                attached: row.attached,
+                automatic_hold: row
+                    .automatic_hold
+                    .as_ref()
+                    .map(dudes_proto::AutomaticHold::hold_reason),
+            },
+            last_turn_end: row.last_turn_end,
+            open_question: row.open_question.clone(),
+            goal: GoalInput {
+                text: goal.goal.text.clone(),
+                hop_cap: goal.goal.hop_cap,
+                turns_on_goal: goal.turns_on_goal,
+                budget: goal.goal.budget,
+                spent: spend.goal,
+                unknown_ends: spend.goal_unknown_ends,
+                predicate: goal.predicate,
+                baseline: goal
+                    .goal
+                    .baseline
+                    .as_ref()
+                    .map(dudes_proto::CheckBaseline::kind),
+            },
+            agent: AgentInput {
+                budget: row.budget,
+                spent_today: spend.agent_today,
+                unknown_ends_today: spend.agent_unknown_ends_today,
+                rung: row.rung,
+            },
+            floor: FloorInput {
+                usd_per_day: floor_usd_per_day,
+                spent_today: spend.floor_today,
+                unknown_ends_today: spend.floor_unknown_ends_today,
+            },
+            per_turn_floor,
+            // Gate 7's card, mail and digest, computed by the caller from the board projection,
+            // the mailbox and the memory projection; each is a crate this one does not depend on
+            // and must not. Whatever was last pushed on `Input::Work`, or the default when
+            // nothing has been: no card, no mail, no digest, which is the goal text alone.
+            work,
+            answers: row
+                .pending_answers
+                .iter()
+                .map(|pending| AnswerInput {
+                    lsn: pending.lsn,
+                    question: pending.question.clone(),
+                    text: pending.text.clone(),
+                })
+                .collect(),
+        })
+    }
+
+    /// Unspawned issues whose replay is still owed, excluding durable browser cancellation tombstones.
+    pub fn issued_not_spawned(&self) -> impl Iterator<Item = (TurnId, &TurnRow)> {
+        let issues = &self.browser_issues;
+        self.turns
+            .iter()
+            .filter(move |(turn, row)| {
+                row.is_issued_not_spawned()
+                    && issues
+                        .get(*turn)
+                        .is_none_or(|issue| issue.cancellation.is_none())
+            })
+            .map(|(turn, row)| (*turn, row))
+    }
+
+    /// The latest qualifying unconfirmed resume for `agent`, when one remains unrecovered.
+    #[must_use]
+    pub(crate) fn unconfirmed_resume(&self, agent: AgentId) -> Option<TurnId> {
+        self.unconfirmed_resumes.get(&agent).copied()
+    }
+
+    /// Turns with a recorded child and no recorded end: crash rule (3).
+    pub fn open_children(&self) -> impl Iterator<Item = (TurnId, &TurnRow)> {
+        self.turns
+            .iter()
+            .filter(|(_, row)| row.is_open_child())
+            .map(|(turn, row)| (*turn, row))
+    }
+
+    /// Every recorded child whose end is not recorded, by owning agent and adoption key: a turn
+    /// child until its `TurnEnded`, an attached child until its `Detached`. A retired agent's
+    /// children are included. A turn child whose key is incomplete cannot be walked
+    /// to, so it is not here.
+    pub fn recorded_children(&self) -> impl Iterator<Item = (AgentId, AdoptionKey)> + '_ {
+        let turns = self
+            .open_children()
+            .filter_map(|(_, row)| row.adoption_key().map(|key| (row.agent, key)));
+        let attached = self
+            .attached_children()
+            .map(|(agent, key)| (agent, key.clone()));
+        turns.chain(attached)
+    }
+
+    /// Each attached agent's recorded PTY child: the key of its `PtySpawned`, until its `Detached`
+    /// clears it. A retired agent's is included until then.
+    pub fn attached_children(&self) -> impl Iterator<Item = (AgentId, &AdoptionKey)> {
+        self.attached_children
+            .iter()
+            .map(|(agent, key)| (*agent, key))
+    }
+
+    /// Agents with an `Attached` and no `Detached`; without confirmed old-PTY absence they hold.
+    pub fn attached_agents(&self) -> impl Iterator<Item = AgentId> {
+        self.agents
+            .iter()
+            .filter(|(_, row)| row.attached && !row.retired)
+            .map(|(agent, _)| *agent)
+    }
+
+    /// The goal an agent pursues, when it has one that has not been cleared.
+    #[must_use]
+    pub fn goal_of(&self, agent: AgentId) -> Option<&GoalRow> {
+        let goal = self.agents.get(&agent)?.goal?;
+        self.goals.get(&goal).filter(|row| !row.cleared)
+    }
+
+    /// The agent an agent-token hash was minted for, when some `HookTokenMinted` carries that hash
+    /// and that agent is not retired, or is retired and still has a recorded child.
+    ///
+    /// **The projection an implementation of `dudes_rpc::MintedTokens` reads**, which is why it
+    /// takes the hash and not the token: the plaintext is never journaled, so hashing belongs to
+    /// the implementation that holds a presented token, and this crate answers about the fold.
+    /// What a presented token then resolves to is decided by `classify`, which this method neither
+    /// implements nor restates: it answers only which of that table's rows a presented token
+    /// falls in — row 2, the retired-agent row or row 3, as `MintedTokens` puts it — and nothing about
+    /// the columns, which are peer provenance and are resolved elsewhere.
+    ///
+    /// `None` is the answer for a hash nothing minted **and** for the hash of a retired agent with
+    /// no recorded child, because those are one row and a caller that could tell them apart would
+    /// have an oracle for which agents exist.
+    ///
+    /// **A hash whose agent this fold has no row for is also `None`**, which is the direction
+    /// invariant 8 requires: the fold cannot assert "not retired" about an agent it has never
+    /// seen hired, and an identity it cannot prove is refused. In a whole journal the hire always
+    /// precedes the mint, so this is the answer to a truncated one rather than to anything the
+    /// machine writes.
+    #[must_use]
+    pub fn agent_for_token_hash(&self, token_hash: &str) -> Option<MintedFor> {
+        let agent = *self.minted.get(token_hash)?;
+        self.minted_for(agent, || {
+            self.recorded_children().any(|(owner, _)| owner == agent)
+        })
+    }
+
+    /// `has_recorded_child` is asked only for a retired agent, so a fold with no retired minting
+    /// never walks the children.
+    fn minted_for(
+        &self,
+        agent: AgentId,
+        has_recorded_child: impl FnOnce() -> bool,
+    ) -> Option<MintedFor> {
+        let row = self.agents.get(&agent)?;
+        if !row.retired {
+            return Some(MintedFor::Live(agent));
+        }
+        has_recorded_child().then_some(MintedFor::RetiredWithChild(agent))
+    }
+
+    /// [`World::agent_for_token_hash`] over its whole domain: every journaled hash this fold
+    /// answers an agent for.
+    ///
+    /// **This adds no rule.** A hash is in the answer exactly when
+    /// [`World::agent_for_token_hash`] returns `Some` for it, which is what the two share an
+    /// implementation for: set membership over every minting for an agent this fold has a
+    /// non-retired row for, or a retired row with a recorded child, never the newest,
+    /// and absent for an agent it has never seen hired.
+    ///
+    /// **Owned, so it can leave the loop thread.** `World` is folded by the single writer and a
+    /// caller on another thread cannot hold a borrow of it; a snapshot can be published and read
+    /// without one. What that costs — how stale a reader's copy may be, and which direction the
+    /// staleness falls — is the publisher's to state, not this method's: it answers about the
+    /// fold as it stands when it is called.
+    #[must_use]
+    pub fn token_hash_owners(&self) -> BTreeMap<String, MintedFor> {
+        let with_children = OnceCell::new();
+        self.minted
+            .iter()
+            .filter_map(|(hash, agent)| {
+                self.minted_for(*agent, || {
+                    with_children
+                        .get_or_init(|| {
+                            self.recorded_children()
+                                .map(|(owner, _)| owner)
+                                .collect::<BTreeSet<AgentId>>()
+                        })
+                        .contains(agent)
+                })
+                .map(|owner| (hash.clone(), owner))
+            })
+            .collect()
+    }
+
+    /// `session`'s running total as the journal last recorded it: the last confirmed turn's
+    /// `session_usage`, or, for records written before the running total was recorded, the sum of their usage.
+    #[must_use]
+    pub fn session_total(&self, session: &SessionId) -> Usage {
+        self.session_totals
+            .get(session)
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
+/// Which of the classification table's token rows a journaled agent-token hash reaches, and for which
+/// agent. It mirrors `dudes_rpc::TokenOwner` because this crate does not depend on `dudes-rpc`,
+/// and `dudes-types` holds only types that cross a process boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MintedFor {
+    /// Row 2: the agent is not retired.
+    Live(AgentId),
+    /// The retired-agent row: the agent is retired and still has a recorded child.
+    RetiredWithChild(AgentId),
+}
+
+fn no_positive_usage(usage: &Usage) -> bool {
+    usage.total_tokens().count() == 0 && usage.usd.is_none_or(|usd| usd.micros() == 0)
+}
+
+fn launch_failed_reason(reason: &str) -> String {
+    if reason.len() <= 128
+        && reason
+            .strip_prefix("managed process could not launch (")
+            .and_then(|part| part.strip_suffix(')'))
+            .is_some_and(|kind| {
+                !kind.is_empty() && kind.bytes().all(|byte| byte.is_ascii_alphabetic())
+            })
+    {
+        reason.to_owned()
+    } else {
+        "managed process could not launch (unknown error)".to_owned()
+    }
+}

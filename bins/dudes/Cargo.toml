@@ -1,0 +1,104 @@
+[package]
+name = "dudes"
+description = "The Dudes CLI: one binary that is the operator's door and the agent's door."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+# Not published, for the reason `bins/duded` gives: a binary is a release artefact, not a library
+# anyone builds against.
+publish = false
+
+# Two targets, one package, and the split is `bins/duded`'s for the same reason. A bin-only package
+# cannot be reached by an integration test, and most of what this package asserts is about the
+# library's shape — the credential's *read* and its *presentation* as two functions with an
+# `OperatorCredential` between them. With a lib target `tests/` reaches
+# those directly *and* still runs the real binary through `env!("CARGO_BIN_EXE_dudes")`, which is
+# what the door tests need: an exit code is a property of a process.
+[lib]
+name = "dudes"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dudes"
+path = "src/main.rs"
+
+# A client, and the dependency list is the evidence. The contract, the transport, the vocabulary and
+# a JSON encoder and the provider crate's redacting environment-variable type — nothing that
+# journals, decides, owns a child or runs a runtime. `cargo xtask layering`'s `dudes` row is the
+# enforcement; this list is only what it reads.
+[dependencies]
+dudes-proto.workspace = true
+dudes-providers.workspace = true
+dudes-rpc.workspace = true
+dudes-types = { workspace = true, features = ["std"] }
+# `dudes tail` shows each record's time in the operating system's zone.
+chrono.workspace = true
+# The launch file's random name, so nothing can create its path in advance.
+getrandom.workspace = true
+serde = { workspace = true, features = ["std"] }
+serde_json.workspace = true
+# `dudes workspace` hashes exactly the bytes it wrote. It and `dudes config` edit the operator's
+# file in place.
+sha2.workspace = true
+thiserror = { workspace = true, features = ["std"] }
+# Quickstart reads which variables the operator file's `[mcp.servers]` declares, to forward them.
+toml.workspace = true
+toml_edit.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# Creates the final runtime-directory leaf with its DACL at creation time. The CLI reaches no
+# process ownership capability through this filesystem-only crate.
+dudes-win.workspace = true
+# Starts the detached daemon with an explicit inherited-handle list containing only null stdin and
+# the two daemon-log handles. The dependency is exact-pinned at the workspace root.
+windows-spawn.workspace = true
+
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+rustix = { workspace = true, features = ["fs"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+# The hostile-listener fixture binds a real named pipe in a second process. Test-only: the shipped
+# CLI still reaches the pipe implementation solely through `dudes-rpc::LocalClient`.
+interprocess.workspace = true
+
+# No argument-parsing crate. Nine commands and a few dozen flags, parsed from `Vec<OsString>` in
+# `src/args.rs`; `bins/duded/src/main.rs` states the house line this follows — "a dependency is
+# forever" — and no arg crate is in `[workspace.dependencies]` today, so adding one would be a
+# `cargo deny` surface change this package has no need to make.
+
+# Every one of these is a **dev**-dependency, and that is load-bearing rather than tidy: the
+# layering graph `cargo xtask layering` walks drops edges whose `dep_kinds` are all `dev`
+# (`xtask/src/metadata.rs`'s `dev_only`), so none of these is an edge in this package's rule. What
+# they buy is a daemon booted in-process — the same `duded::boot` the shipped daemon runs — carrying
+# the real `PeerClassifier` over the two ports that have no live implementation.
+[dev-dependencies]
+duded.workspace = true
+dudes-journal.workspace = true
+# `BreakerConfig`, one field of the daemon's `Settings`. The CLI links the loop nowhere.
+dudes-policy.workspace = true
+# `testing` for `FakeResolver` and `FakeMintedTokens` — `PeerClassifier`'s two ports. Not for
+# `AdmitAll`: a permissive authorizer would make every refusal arm here meaningless, and the tests
+# that matter turn on the *credential's readability* with the classifier held constant.
+dudes-rpc = { workspace = true, features = ["testing"] }
+# `testing` for `FakeHost` and `FakeRng` — the seams `tests/common/mod.rs` hands the in-process
+# daemon. This package names the crate nowhere else: the CLI has no `[dependencies]` entry for it,
+# so this line is the whole of its exposure and the shipped binary links neither the crate nor
+# `FakeRng`'s counted token.
+dudes-supervisor = { workspace = true, features = ["testing"] }
+# Parses the cfg-disabled Windows spawn arm so its capability and handle associations are checked
+# on every host. This package is already present in the locked workspace graph.
+syn.workspace = true
+# The process-level quickstart test owns and stops the detached daemon by signal, and drives the
+# guided quickstart through a pseudo-terminal. The opener's unit test reaps the stand-in opener it
+# let go, so no child outlives the test. Test-only: the shipped CLI uses `std`'s child handle for
+# startup failure cleanup and `std`'s terminal test.
+nix = { workspace = true, features = ["process", "signal", "term"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true

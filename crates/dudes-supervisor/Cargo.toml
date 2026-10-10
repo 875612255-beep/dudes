@@ -1,0 +1,72 @@
+[package]
+name = "dudes-supervisor"
+description = "The sans-io machine of the Dudes supervisor: handle(Input) -> &[Effect], the agent state machines and the persist-before-spawn ledger. No I/O; time and randomness enter through seams."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+# `testing` — the fakes and the harness in `src/testing.rs`, and nothing else. There is no
+# `default` table on purpose: the absence of one is what makes "off unless asked for" the property
+# rather than a line somebody can edit.
+#
+# What it is protecting is narrower and sharper than "test code should not ship". `FakeRng` is not
+# an inert stub — it fakes the *entropy source for a credential*. `agent_token()` formats its
+# counter left-padded with `A` to `HOOK_TOKEN_LEN` and constructs the result through the production
+# `HookToken::new`, so what it emits is a fully well-formed agent token with no test shape to it,
+# drawn from a space an attacker enumerates from 1 upward. The mint that feeds on it is the real
+# one (`src/token.rs`), and its plaintext is the token half of invariant 8 — the capability that
+# separates one agent from another on the socket. `Supervisor::new` is generic over `Rng`, so
+# before this feature existed a daemon reached a guessable mint with one `use` statement and no
+# manifest edit at all. The feature is what makes `cargo build -p dudes-supervisor` unable to
+# compile it.
+#
+# It enables no dependency, which is why it does not disturb the graph `cargo xtask layering`
+# walks: that gate reads `cargo metadata --all-features`, and a feature with an empty edge list
+# adds no edge at any feature set. Keep it empty.
+#
+# `tests/no_default_fakes.rs` is the guard on the four ways this arrangement is undone silently —
+# two of them edits to this file and `src/lib.rs`, two of them edits to a dependent's manifest. It
+# says there what it does not cover, and it is not fail-closed.
+[features]
+testing = []
+
+[dependencies]
+blake3.workspace = true
+dudes-policy.workspace = true
+dudes-proto.workspace = true
+dudes-providers.workspace = true
+dudes-types = { workspace = true, features = ["std"] }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+ulid.workspace = true
+
+# The self-reference is how this crate's own `tests/` reach `testing`. An integration test is a
+# separate crate that depends on this one, so it gets the default feature set like any other
+# dependent and cannot see a gated module without asking; naming the package here is the one way to
+# ask. Cargo permits the cycle because it runs through `[dev-dependencies]`; the suite compiling is
+# the demonstration. Nothing here is published yet, so what `cargo publish` makes of a self
+# dev-dependency is untested and this comment does not claim it.
+#
+# **A dev-dependency, and it has to stay one.** Resolver 3 does not unify a dev-dependency's
+# features into a build that needs no dev-dependencies, so this line is invisible to
+# `cargo build`/`cargo check` without `--all-targets` and to anything that links this crate. Moved
+# to `[dependencies]` it would turn the feature on for every dependent in the workspace, which is
+# the whole defect back.
+#
+# **Declared `workspace = true`, not `path = "."`.** `cargo deny`'s `[bans.workspace-dependencies]`
+# refuses a crate whose declarations do not *all* go through the shared workspace dependency, and
+# `dudes-host`, `bins/duded` and `bins/dudes` already depend on this one. The workspace entry is a
+# path dependency on this same directory, so the two forms resolve identically; only one of them
+# keeps the version declared in one place.
+[dev-dependencies]
+dudes-supervisor = { workspace = true, features = ["testing"] }
+proptest.workspace = true
+
+[lints]
+workspace = true

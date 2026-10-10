@@ -1,0 +1,129 @@
+[package]
+name = "duded"
+description = "The Dudes daemon: the single journal writer, the decide loop, and the runtime tasks that execute the supervisor's effects."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+# Not published. The daemon is a binary, not a library anyone builds against.
+publish = false
+
+# Two targets, one package, and the split is not stylistic. A bin-only package cannot be reached by
+# an integration test, and most of what this package has to assert is internal ordering — the seven
+# startup steps, exactly one child after a crash, `shutdown` once per exit path. With a lib target
+# `tests/` reaches the logic directly *and* reaches the real binary through
+# `env!("CARGO_BIN_EXE_duded")` for the exits that need a real process and a real signal.
+[lib]
+name = "duded"
+path = "src/lib.rs"
+
+[[bin]]
+name = "duded"
+path = "src/main.rs"
+
+[features]
+# Crash-recovery tests and nothing else: `src/fault.rs` and the one seam in `main.rs` that wraps
+# the host with its two stall points. **Off by default and never enabled by `--workspace`**, so the
+# released daemon does not contain the code — the same compile-time absence `dudes-rpc`'s `testing`
+# feature gives the permissive authorisers. `examples/two-roles/crash.sh` and
+# `examples/two-roles/crash-after-spawn.sh` build with it and each prints that it did.
+fault-injection = []
+
+# The cost-reporting check and nothing else: `configured_claude` and the `[providers.codex]` and
+# `[providers.pi]` refusal in `main.rs`, and the `examples/stub-agent.rs` program `configured_claude`
+# points at. **Off by default and never enabled by
+# `--workspace`**, so the released daemon does not contain the code, and `tests/dev_features.rs`
+# is what fails if either of these two features is ever defaulted on. A feature-on daemon whose
+# `DUDES_STUB_PROVIDER_COMMAND` is unset refuses to start rather than falling back to the real
+# provider CLI, which is the property the whole feature exists for.
+#
+# A consequence worth knowing before you enable it: four tests that exec the daemon binary
+# (`tests/restart.rs`, `tests/budget.rs`, `tests/predicate_environment.rs`) expect it to boot, and a
+# feature-on daemon with no stub configured deliberately does not. So `--features stub-provider` is
+# for building the stub-provider acceptance script's daemon, not for running the suite. The suite is green the way
+# CI runs it, because this feature is off by default and `--workspace` never turns it on.
+stub-provider = []
+
+# Test seams the integration tests reach and the released daemon does not contain:
+# `floor_terminal::TerminalSkew`. Enabled only by this package's own dev-dependency below, which
+# resolver 3 keeps out of every build that needs no dev-dependencies.
+testing = []
+
+[[example]]
+name = "stub-agent"
+required-features = ["stub-provider"]
+
+[dependencies]
+dudes-journal.workspace = true
+dudes-policy.workspace = true
+dudes-proto.workspace = true
+dudes-providers.workspace = true
+dudes-pty.workspace = true
+dudes-rpc.workspace = true
+dudes-supervisor.workspace = true
+dudes-types.workspace = true
+# `main.rs` is the only file in this package that names it: it constructs the two concrete children
+# owners and hands them in as seams. `tests/host_seam.rs` is the check.
+dudes-host.workspace = true
+anyhow.workspace = true
+serde = { workspace = true, features = ["std"] }
+serde_json.workspace = true
+toml.workspace = true
+tracing.workspace = true
+# The vocabulary of an id.
+ulid.workspace = true
+# Where every id and every secret this daemon mints gets its bytes.
+getrandom.workspace = true
+httparse.workspace = true
+chrono.workspace = true
+sha2.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# The daemon is the runtime directory's other creator and verifies the inherited credential DACL.
+dudes-win.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# `SIGTERM` is one of the three exit paths invariant 10 must hold on, and the default disposition
+# ends the process before `shutdown` can run. `nix` blocks the signal and waits for it with safe
+# calls — `pthread_sigmask` and `sigwait` — so this package needs no `unsafe` and keeps the
+# workspace's `forbid`. Already in the graph for `dudes-rpc`'s peer credentials; this adds a feature
+# of that same crate and no new one. `user` reads the user name of the daemon's uid, safely, for a
+# composed environment that carries no `USER` (`with_user_name` in `main.rs`).
+nix = { workspace = true, features = ["signal", "user"] }
+# The single-writer lock, and nothing else. `flock(2)` is what makes invariant 1's "one writer"
+# survive a `SIGKILL`ed daemon: the kernel drops the lock when the descriptor closes, so a crashed
+# run does not leave a lock file that a restart has to reason about. `fs` on top of the workspace's
+# `process`; nothing here opens a socket or a terminal through rustix.
+rustix = { workspace = true, features = ["fs"] }
+
+[dev-dependencies]
+dudes-proto = { workspace = true, features = ["unstable-testing"] }
+# The scripted PTY port matches a `PtyWriteRequested` to the bytes it is being handed, and the
+# record identifies them only by their blake3 digest. Dev-only: the daemon itself never re-derives
+# a digest the router already computed.
+blake3.workspace = true
+# Existing test-only feature for the provenance-deletion mutation harness. It retains authority
+# acquired from the real source while selecting an otherwise impossible failing provenance cell;
+# it remains absent from the released daemon.
+dudes-rpc = { workspace = true, features = ["testing"] }
+# `testing` for `FakeHost` and `FakeRng`, the two seams `tests/common/mod.rs` fills. **Here and not
+# in `[dependencies]`**, where this package's shipping entry for the same crate sits: the feature
+# carries `FakeRng`, whose `agent_token()` is a counter left-padded with `A`, and this is the
+# package that mints the real thing. Resolver 3 keeps a dev-dependency's features out of a build
+# that needs no dev-dependencies, so the daemon binary links the crate without them; moving this
+# line up would put a guessable mint one `use` statement from `main.rs`.
+dudes-supervisor = { workspace = true, features = ["testing"] }
+duded = { workspace = true, features = ["testing"] }
+tempfile.workspace = true
+chrono-tz.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+# The reload test creates a FIFO without invoking an external command.
+nix = { workspace = true, features = ["fs"] }
+
+[lints]
+workspace = true

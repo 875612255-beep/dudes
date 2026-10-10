@@ -1,0 +1,1447 @@
+//! `dudes quickstart` with a setup: options from a script, and questions on a terminal.
+//!
+//! Each test builds an installed layout in a temporary root: a copy of `duded` beside a copy of the
+//! Floor release fixture, a stand-in `claude` and `codex` on the daemon's `PATH`, a home, and a
+//! repository to enroll. A stand-in records each run in `engine-runs`. Its status command exits 1
+//! while `<engine>-signed-out` exists, and its login records how it ran in `<engine>-login`, then
+//! exits 7. `SSH_TTY` is set on every run, so a terminal run prints the Floor link rather than
+//! opening a real browser. Run `cargo build -p duded --locked` before a filtered run: the copy is
+//! taken from beside the `dudes` under test.
+
+#![cfg(unix)]
+
+use std::fs::File;
+use std::io::{Read as _, Write as _};
+use std::os::fd::OwnedFd;
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
+use std::time::{Duration, Instant};
+
+use dudes::config::{Key, Settings};
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
+
+mod common;
+
+use common::{Cli, run_program};
+
+const SPAWN_MARKER: &str = "quickstart started duded pid ";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const FLOOR_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../duded/tests/fixtures/floor-release-v3"
+);
+
+/// An installed `duded` with a Floor, two stand-in engines, a home and a repository.
+struct Layout {
+    root: tempfile::TempDir,
+}
+
+impl Layout {
+    fn new() -> Self {
+        let root = tempfile::tempdir().expect("a root");
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).expect("a bin directory");
+        let mut built = PathBuf::from(env!("CARGO_BIN_EXE_dudes"));
+        built.set_file_name("duded");
+        std::fs::copy(&built, bin.join("duded")).unwrap_or_else(|error| {
+            panic!(
+                "copying {}: {error}; run `cargo build -p duded --locked` first",
+                built.display()
+            )
+        });
+        copy_tree(Path::new(FLOOR_FIXTURE), &bin.join("floor"));
+        let engines = root.path().join("engines");
+        std::fs::create_dir(&engines).expect("an engines directory");
+        std::fs::create_dir(root.path().join("probe-runs")).expect("probe records");
+        for engine in ["claude", "codex"] {
+            let path = engines.join(engine);
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\n\
+                     [ \"$1\" = warm ] && exit 0\n\
+                     root='{root}'\n\
+                     echo \"{engine} $*\" >> \"$root/engine-runs\"\n\
+                     printf '%s\\0' \"$(pwd -P)\" \"${{CODEX_HOME-}}\" \"$@\" > \"$root/probe-{engine}-$$\"\n\
+                     mv \"$root/probe-{engine}-$$\" \"$root/probe-runs/{engine}-$$\"\n\
+                     case \"$*\" in\n\
+                     '--version') [ '{engine}' = codex ] && printf '%s\\n' 'codex-cli 0.160.0'; exit 0 ;;\n\
+                     'auth status'|'login status') [ -e \"$root/{engine}-signed-out\" ] && exit 1; exit 0 ;;\n\
+                     'auth login'|'login')\n\
+                     if [ -t 0 ] && [ -t 1 ]; then held=tty; else held=no-tty; fi\n\
+                     {{ echo \"$held\"; pwd -P\n\
+                     echo \"${{DUDES_TOKEN-unset}} ${{DUDES_SOCK-unset}}\"; }} > \"$root/{engine}-login\"\n\
+                     exit 7 ;;\n\
+                     esac\n",
+                    root = root.path().display()
+                ),
+            )
+            .expect("a stand-in engine");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("a runnable stand-in");
+            // macOS may pause a new program's first run to assess it; paying that here keeps the
+            // daemon's three-second wait for a status check about the check.
+            let warm = run_program(&path, &[std::ffi::OsString::from("warm")]);
+            assert_eq!(warm.code(), 0, "{warm:?}");
+        }
+        std::fs::create_dir_all(root.path().join("repo/.git")).expect("a repository");
+        std::fs::create_dir(root.path().join("home")).expect("a home");
+        Self { root }
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.root.path().join(name)
+    }
+
+    fn cli(&self) -> Cli {
+        Cli::bare()
+            .env("HOME", self.path("home"))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", self.path("engines").display()),
+            )
+            .env("DUDES_DAEMON", self.path("bin/duded"))
+            .env("DUDES_STATE_DIR", self.path("state"))
+            .env("DUDES_RUNTIME_DIR", self.path("run"))
+            .env("SSH_TTY", "/dev/ttys-test")
+            .current_dir(&self.path("repo"))
+    }
+
+    fn sign_out(&self, engine: &str) {
+        std::fs::write(self.path(&format!("{engine}-signed-out")), "").expect("sign out");
+    }
+
+    fn config(&self) -> PathBuf {
+        let home = self.path("home").into_os_string();
+        dudes::Environment::resolve(|name| (name == "HOME").then(|| home.clone()))
+            .config()
+            .expect("an absolute home names the operator file")
+            .to_path_buf()
+    }
+
+    fn socket(&self) -> PathBuf {
+        self.path("run/duded.sock")
+    }
+
+    fn repo(&self) -> PathBuf {
+        self.path("repo").canonicalize().expect("the repository")
+    }
+
+    fn daemons(&self) -> Vec<i32> {
+        std::fs::read_to_string(self.path("run/duded.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.strip_prefix(SPAWN_MARKER)?.parse().ok())
+            .collect()
+    }
+
+    fn engine_runs(&self) -> Option<String> {
+        std::fs::read_to_string(self.path("engine-runs")).ok()
+    }
+}
+
+impl Drop for Layout {
+    fn drop(&mut self) {
+        for pid in self.daemons() {
+            let pid = Pid::from_raw(pid);
+            let _ = kill(pid, Signal::SIGTERM);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while kill(pid, None).is_ok() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let _ = kill(pid, Signal::SIGKILL);
+        }
+    }
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("a destination directory");
+    for entry in std::fs::read_dir(from).expect("the Floor fixture") {
+        let entry = entry.expect("a fixture entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("a file type").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("a fixture file");
+        }
+    }
+}
+
+fn alive(pid: i32) -> bool {
+    kill(Pid::from_raw(pid), None).is_ok()
+}
+
+/// What a set-up quickstart prints after the daemon starts, in order: the ping, each engine with
+/// its sign-in, the Floor, and the hire. A terminal run gets the Floor link, printed because this
+/// is an SSH session; a script is told the command and gets no live link.
+fn assert_set_up(run_output: &str, layout: &Layout, terminal: bool) {
+    let engines = layout.path("engines");
+    let floor: &[&str] = if terminal {
+        &[
+            "dudes: opening no browser: this is an SSH session",
+            "the Floor is at http://127.0.0.1:",
+            "#bootstrap=",
+        ]
+    } else {
+        &["Open the Floor with: dudes floor open"]
+    };
+    let expected: Vec<String> = [
+        format!("duded {VERSION} on {}", layout.socket().display()),
+        "Engines the daemon turned on:".to_owned(),
+        format!(
+            "  claude: found at {}, signed in",
+            engines.join("claude").display()
+        ),
+        format!(
+            "  codex: found at {}, signed in",
+            engines.join("codex").display()
+        ),
+    ]
+    .into_iter()
+    .chain(floor.iter().map(|line| (*line).to_owned()))
+    .chain(["hired ".to_owned()])
+    .collect();
+    if !terminal {
+        assert!(
+            !run_output.contains("#bootstrap="),
+            "a script printed a live Floor link:\n{run_output}"
+        );
+    }
+    let mut rest = run_output;
+    for line in &expected {
+        let at = rest
+            .find(line.as_str())
+            .unwrap_or_else(|| panic!("`{line}` is missing or out of order in:\n{run_output}"));
+        rest = &rest[at + line.len()..];
+    }
+    assert_only_status_checks(layout);
+}
+
+/// The daemon ran each engine's status command, and nothing else of any engine ran.
+fn assert_only_status_checks(layout: &Layout) {
+    let runs = layout.engine_runs().unwrap_or_default();
+    assert!(
+        runs.lines()
+            .all(|line| line == "claude auth status" || line == "codex login status"),
+        "an engine ran something other than its status command:\n{runs}"
+    );
+}
+
+/// The file both setups write: Codex, the Floor's answer and Hire, no budget, and the workspace
+/// with no ceiling.
+fn assert_written(layout: &Layout) {
+    let config = layout.config();
+    let file = Settings::read(&config).expect("the operator file");
+    let shown: Vec<(Key, String)> = Key::ALL
+        .into_iter()
+        .map(|key| (key, file.shown(key)))
+        .collect();
+    let expected = [
+        (Key::Codex, "on"),
+        (Key::CodexStreaming, "off"),
+        (Key::Pi, "off"),
+        (Key::Answer, "on"),
+        (Key::Hire, "on"),
+        (Key::Control, "off"),
+        (Key::Goal, "off"),
+        (Key::Renew, "off"),
+        (Key::Retire, "off"),
+        (Key::Terminal, "off"),
+        (Key::Git, "off"),
+        (Key::FloorUsdPerDay, "none"),
+        (Key::PerTurnUsd, "0.25"),
+        (Key::PerTurnTokens, "20000"),
+    ]
+    .map(|(key, value)| (key, value.to_owned()));
+    assert_eq!(shown, expected);
+    let text = std::fs::read_to_string(&config).expect("the operator file's text");
+    for line in [
+        "workspace_id = \"repo\"".to_owned(),
+        "label = \"repo\"".to_owned(),
+        "completion_check_label = \"README says hello\"".to_owned(),
+        format!("cwd = \"{}\"", layout.repo().display()),
+        "department = \"engineering\"".to_owned(),
+        "hop_cap = 5".to_owned(),
+        "predicate_argv = [\"/usr/bin/true\"]".to_owned(),
+        "predicate_timeout_s = 600".to_owned(),
+    ] {
+        assert!(text.contains(&line), "`{line}` is not in:\n{text}");
+    }
+    assert!(
+        ["[budget", "agent_usd_per_day", "goal_usd"]
+            .iter()
+            .all(|key| !text.contains(key)),
+        "no ceiling was written:\n{text}"
+    );
+}
+
+/// A script answers every step with options, and nothing is asked.
+#[test]
+fn a_script_sets_up_enrolls_and_hires_without_a_question() {
+    let layout = Layout::new();
+    let run = layout
+        .cli()
+        .args([
+            "quickstart",
+            "--set",
+            "providers.codex",
+            "on",
+            "--set",
+            "floor.answer",
+            "on",
+            "--set",
+            "floor.hire",
+            "on",
+            "--enroll",
+            "--check-label",
+            "README says hello",
+            "--hire",
+            "Kim",
+            "--provider",
+            "codex",
+            "--",
+            "/usr/bin/true",
+        ])
+        .run();
+
+    assert_eq!(run.code(), dudes::exit::SUCCESS, "{run:?}");
+    assert_eq!(run.stderr, "", "{run:?}");
+    assert!(
+        !run.stdout.contains('?'),
+        "a script is asked nothing: {run:?}"
+    );
+    assert_set_up(&run.stdout, &layout, false);
+    assert_written(&layout);
+}
+
+/// A script whose completion check the daemon cannot run still hires and enrolls, and the refused
+/// goal names the agent left without one and the enrolled workspace that holds the same check.
+#[test]
+fn a_script_whose_check_cannot_run_hires_without_a_goal() {
+    let layout = Layout::new();
+    let run = layout
+        .cli()
+        .args([
+            "quickstart",
+            "--enroll",
+            "--check-label",
+            "q.txt exists",
+            "--hire",
+            "Kim",
+            "--goal",
+            "write q.txt",
+            "--",
+            "test -f q.txt",
+        ])
+        .run();
+
+    assert_eq!(run.code(), dudes::exit::OTHER, "{run:?}");
+    let agent = run
+        .stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("hired "))
+        .unwrap_or_else(|| panic!("the hire is printed: {run:?}"));
+    assert_eq!(
+        run.stderr,
+        format!(
+            "dudes: goal.set: the completion check cannot run: `test -f q.txt` is not on the \
+             daemon's PATH; give each word as its own argument, not one quoted string: test -f \
+             q.txt; Kim is already hired, so running quickstart again would hire a second agent; \
+             give Kim a goal with: dudes goal --agent {agent} --text <text> --hop-cap 5 -- \
+             <program> [args...]; workspace repo is enrolled with the same check, so the Floor \
+             offers no hire there until you change its predicate_argv in {} and run dudes \
+             workspace reload, then dudes workspace reload --apply <sha256> (-32602)\n",
+            layout.config().display()
+        )
+    );
+}
+
+/// The first goal of a workspace quickstart enrolls in the same run records the workspace check's
+/// name and label. A later run that finds the workspace enrolled hires with a goal and names no
+/// check, because the check it asks for is not the enrolled one.
+#[test]
+fn a_script_that_enrolls_names_the_first_goals_check() {
+    let layout = Layout::new();
+    let quickstart = |name: &str| {
+        let run = layout
+            .cli()
+            .args([
+                "quickstart",
+                "--set",
+                "floor.hire",
+                "on",
+                "--enroll",
+                "--check-label",
+                " README says hello ",
+                "--hire",
+                name,
+                "--goal",
+                "Say hello in the README",
+                "--",
+                "/usr/bin/false",
+            ])
+            .run();
+        assert_eq!(run.code(), dudes::exit::SUCCESS, "{run:?}");
+        run
+    };
+    quickstart("Kim");
+    let again = quickstart("Leo");
+    assert!(
+        again.stdout.contains("its entry stays as it is"),
+        "{again:?}"
+    );
+
+    let journal = layout.path("state").join("journal");
+    let checks: Vec<Option<(String, String)>> = dudes_journal::Reader::new(&journal)
+        .iter_from(dudes_types::Lsn::ZERO)
+        .expect("the journal")
+        .filter_map(|item| match item.expect("an entry").1.record {
+            dudes_proto::Record::GoalSet { goal, .. } => {
+                Some(goal.completion_check.map(|check| (check.id, check.label)))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        checks,
+        [
+            Some(("default".to_owned(), "README says hello".to_owned())),
+            None
+        ]
+    );
+}
+
+/// A script whose settings break a start rule is refused whole: the rule is named, and nothing
+/// is written or started.
+#[test]
+fn a_script_the_daemon_would_refuse_is_refused_whole() {
+    let layout = Layout::new();
+    let run = layout
+        .cli()
+        .args([
+            "quickstart",
+            "--set",
+            "floor.goal",
+            "on",
+            "--enroll",
+            "--",
+            "/usr/bin/true",
+        ])
+        .run();
+
+    assert_eq!(run.code(), dudes::exit::OTHER, "{run:?}");
+    assert_eq!(
+        run.stderr,
+        "dudes: the daemon would refuse this configuration when it starts, so nothing was \
+         written: floor.goal on needs floor.control on\n"
+    );
+    assert!(!layout.config().exists(), "nothing was written");
+    assert!(!layout.path("run").exists(), "nothing was started");
+}
+
+/// A script restarts a daemon that runs other settings only with `--restart`. Without it the
+/// file is written, the differences are named and nothing is stopped. A daemon that runs the
+/// file's settings is kept either way. An engine table written by `dudes config` alone counts as
+/// other settings, which is the arm `floor.enrollment.reload` does not report.
+#[test]
+fn a_script_restarts_a_daemon_with_other_settings_only_when_asked() {
+    let layout = Layout::new();
+    let plain = layout.cli().arg("quickstart").run();
+    assert_eq!(plain.code(), dudes::exit::SUCCESS, "{plain:?}");
+    assert_eq!(
+        plain.stdout.lines().count(),
+        2,
+        "without a terminal or options quickstart prints the ping and nothing else: {plain:?}"
+    );
+    let first = layout.daemons();
+    assert_eq!(first.len(), 1, "{plain:?}");
+
+    let unasked = layout
+        .cli()
+        .args(["quickstart", "--set", "floor.answer", "on"])
+        .run();
+    assert_eq!(unasked.code(), dudes::exit::OTHER, "{unasked:?}");
+    assert_eq!(
+        unasked.stderr,
+        format!(
+            "dudes: wrote {}, but the running daemon reads other settings (floor.answer, memory) and \
+             reads the file only when it starts. Nothing was stopped. To apply them, restart it, \
+             which ends any turn it is running: dudes quickstart --restart\n",
+            layout.config().display()
+        )
+    );
+    assert_eq!(layout.daemons(), first, "nothing was stopped or started");
+    assert!(alive(first[0]), "the running daemon was not asked to stop");
+
+    let changed = layout.cli().args(["quickstart", "--restart"]).run();
+    assert_eq!(changed.code(), dudes::exit::SUCCESS, "{changed:?}");
+    assert!(
+        changed.stdout.contains("Restarting the daemon so it reads"),
+        "{changed:?}"
+    );
+    let second = layout.daemons();
+    assert_eq!(second.len(), 2, "{changed:?}");
+    assert!(!alive(first[0]), "the daemon with the old settings stopped");
+
+    let same = layout.cli().args(["quickstart", "--yes"]).run();
+    assert_eq!(same.code(), dudes::exit::SUCCESS, "{same:?}");
+    assert!(!same.stdout.contains("Restarting"), "{same:?}");
+    assert_eq!(
+        layout.daemons(),
+        second,
+        "the daemon with these settings was kept"
+    );
+
+    let edited = layout
+        .cli()
+        .args(["config", "set", "providers.codex", "on"])
+        .run();
+    assert_eq!(edited.code(), dudes::exit::SUCCESS, "{edited:?}");
+    let stale = layout.cli().args(["quickstart", "--yes"]).run();
+    assert_eq!(stale.code(), dudes::exit::OTHER, "{stale:?}");
+    assert!(
+        stale.stderr.contains("kept ") && stale.stderr.contains("(providers.codex)"),
+        "{stale:?}"
+    );
+    assert_eq!(layout.daemons(), second, "{stale:?}");
+    let restarted = layout.cli().args(["quickstart", "--restart"]).run();
+    assert_eq!(restarted.code(), dudes::exit::SUCCESS, "{restarted:?}");
+    assert!(restarted.stdout.contains("Restarting"), "{restarted:?}");
+    assert_eq!(layout.daemons().len(), 3, "{restarted:?}");
+}
+
+/// A daemon started on another `HOME` reads another operator file, so its comparison says nothing
+/// about this one: a script counts that as a difference, stops nothing unless asked, and with
+/// `--restart` starts a daemon that reads this file.
+#[test]
+fn a_script_restarts_a_daemon_that_reads_another_file_only_when_asked() {
+    let layout = Layout::new();
+    let started = layout.cli().arg("quickstart").run();
+    assert_eq!(started.code(), dudes::exit::SUCCESS, "{started:?}");
+    let first = layout.daemons();
+    assert_eq!(first.len(), 1, "{started:?}");
+    let other = layout.path("other-home");
+    std::fs::create_dir(&other).expect("another home");
+    let other_config = {
+        let home = other.clone().into_os_string();
+        dudes::Environment::resolve(|name| (name == "HOME").then(|| home.clone()))
+            .config()
+            .expect("an absolute home names the operator file")
+            .to_path_buf()
+    };
+
+    let unasked = layout
+        .cli()
+        .env("HOME", &other)
+        .args(["quickstart", "--set", "floor.answer", "on"])
+        .run();
+    assert_eq!(unasked.code(), dudes::exit::OTHER, "{unasked:?}");
+    assert_eq!(
+        unasked.stderr,
+        format!(
+            "dudes: wrote {}, but the running daemon reads other settings (the running daemon \
+             reads {}, not this file) and reads the file only when it starts. Nothing was \
+             stopped. To apply them, restart it, which ends any turn it is running: dudes \
+             quickstart --restart\n",
+            other_config.display(),
+            layout.config().display()
+        )
+    );
+    assert_eq!(layout.daemons(), first, "nothing was stopped or started");
+
+    let restarted = layout
+        .cli()
+        .env("HOME", &other)
+        .args(["quickstart", "--restart"])
+        .run();
+    assert_eq!(restarted.code(), dudes::exit::SUCCESS, "{restarted:?}");
+    assert!(
+        restarted.stdout.contains(&format!(
+            "Restarting the daemon so it reads {}.",
+            other_config.display()
+        )),
+        "{restarted:?}"
+    );
+    assert_eq!(layout.daemons().len(), 2, "{restarted:?}");
+    assert!(!alive(first[0]), "the daemon on the other file stopped");
+}
+
+/// A daemon of another version may compare settings this CLI does not know, so a script counts
+/// the version as a difference and stops nothing unless asked.
+#[test]
+fn a_script_counts_a_daemon_of_another_version_as_a_difference() {
+    let layout = Layout::new();
+    std::fs::create_dir(layout.path("run")).expect("a runtime directory");
+    std::fs::set_permissions(layout.path("run"), std::fs::Permissions::from_mode(0o700))
+        .expect("an owner-only runtime directory");
+    common::ping_as(&layout.socket(), "0.0.1");
+
+    let unasked = layout
+        .cli()
+        .args(["quickstart", "--set", "floor.answer", "on"])
+        .run();
+    assert_eq!(unasked.code(), dudes::exit::OTHER, "{unasked:?}");
+    assert_eq!(
+        unasked.stderr,
+        format!(
+            "dudes: wrote {}, but the running daemon reads other settings (the running daemon is \
+             0.0.1, this CLI is {VERSION}) and reads the file only when it starts. Nothing was \
+             stopped. To apply them, restart it, which ends any turn it is running: dudes \
+             quickstart --restart\n",
+            layout.config().display()
+        )
+    );
+    assert!(layout.daemons().is_empty(), "nothing was started");
+}
+
+#[test]
+fn codex_streaming_changes_restart_once_without_disabling_codex() {
+    let layout = Layout::new();
+    let started = layout
+        .cli()
+        .args(["quickstart", "--set", "providers.codex", "on"])
+        .run();
+    assert_eq!(started.code(), dudes::exit::SUCCESS, "{started:?}");
+    let mut managed_home = None;
+    for setting in ["on", "off"] {
+        let before = layout.daemons();
+        let changed = layout
+            .cli()
+            .args(["config", "set", "providers.codex.streaming", setting])
+            .run();
+        assert_eq!(changed.code(), dudes::exit::SUCCESS, "{changed:?}");
+        let stale = layout.cli().args(["quickstart", "--yes"]).run();
+        assert_eq!(stale.code(), dudes::exit::OTHER, "{stale:?}");
+        assert!(stale.stderr.contains("(providers.codex)"), "{stale:?}");
+        assert_eq!(layout.daemons(), before);
+        let restarted = layout.cli().args(["quickstart", "--restart"]).run();
+        assert_eq!(restarted.code(), dudes::exit::SUCCESS, "{restarted:?}");
+        assert_eq!(layout.daemons().len(), before.len() + 1);
+        let after = layout.daemons();
+        let same = layout.cli().args(["quickstart", "--restart"]).run();
+        assert_eq!(same.code(), dudes::exit::SUCCESS, "{same:?}");
+        assert!(!same.stdout.contains("Restarting"), "{same:?}");
+        assert_eq!(layout.daemons(), after);
+        assert!(
+            Settings::read(&layout.config())
+                .unwrap()
+                .satisfies(Key::Codex)
+        );
+        if setting == "on" {
+            let doctor = layout.cli().args(["--json", "doctor"]).run();
+            assert_eq!(doctor.code(), dudes::exit::SUCCESS, "{doctor:?}");
+            let doctor: dudes_proto::rpc::system::DoctorResult = doctor.json();
+            let row = doctor
+                .providers
+                .iter()
+                .find(|row| row.provider == dudes_types::Provider::Codex)
+                .unwrap();
+            let Some(dudes_proto::rpc::system::ProviderLoginHome::Ready { path }) = &row.login_home
+            else {
+                panic!("the configured streaming profile was not admitted");
+            };
+            managed_home = Some(path.clone());
+        }
+    }
+    assert_streaming_probe_calls(&layout, &managed_home.unwrap());
+}
+
+fn assert_streaming_probe_calls(layout: &Layout, home: &Path) {
+    let mut version_seen = false;
+    let mut managed_status_seen = false;
+    for entry in std::fs::read_dir(layout.path("probe-runs")).unwrap() {
+        let entry = entry.unwrap();
+        let record = std::fs::read_to_string(entry.path()).unwrap();
+        assert!(record.ends_with('\0'));
+        let fields: Vec<_> = record.split_terminator('\0').collect();
+        assert!(fields.len() >= 3);
+        let arguments = &fields[2..];
+        let name = entry.file_name();
+        let name = name.to_str().unwrap();
+        if name.starts_with("claude-") {
+            assert_eq!(arguments, ["auth", "status"]);
+        } else {
+            assert!(name.starts_with("codex-"));
+            if arguments == ["login", "status"] {
+                assert_ne!(
+                    fields[1],
+                    home.to_str().unwrap(),
+                    "managed home used without its guards"
+                );
+                continue;
+            }
+            assert_eq!(
+                &fields[..2],
+                [home.to_str().unwrap(), home.to_str().unwrap()]
+            );
+            if arguments == ["--version"] {
+                version_seen = true;
+            } else {
+                assert_eq!(arguments.last(), Some(&"status"));
+                assert_managed_login_arguments(&arguments[..arguments.len() - 1], home);
+                managed_status_seen = true;
+            }
+        }
+    }
+    assert!(version_seen, "the streaming version check did not run");
+    assert!(
+        managed_status_seen,
+        "the protected sign-in status check did not run"
+    );
+}
+
+/// A value the daemon would refuse at start stops nothing and writes nothing: the CLI refuses the
+/// options it can check, and the running daemon reads the new file before anything is stopped.
+/// Either way the old daemon keeps running and the file is as it was.
+#[test]
+fn a_file_the_daemon_would_refuse_stops_nothing_and_is_put_back() {
+    let layout = Layout::new();
+    let started = layout
+        .cli()
+        .args(["quickstart", "--set", "floor.answer", "on"])
+        .run();
+    assert_eq!(started.code(), dudes::exit::SUCCESS, "{started:?}");
+    let daemons = layout.daemons();
+    let config = layout.config();
+
+    let zero = layout
+        .cli()
+        .args([
+            "quickstart",
+            "--restart",
+            "--enroll",
+            "--hop-cap",
+            "0",
+            "--",
+            "/usr/bin/true",
+        ])
+        .run();
+    assert_eq!(zero.code(), dudes::exit::USAGE, "{zero:?}");
+    assert!(
+        zero.stderr
+            .starts_with("dudes: `--hop-cap` does not take `0`: a whole number above zero"),
+        "{zero:?}"
+    );
+
+    let broken = format!(
+        "{}[floor.bogus]\nenabled = true\n",
+        std::fs::read_to_string(&config).expect("the operator file")
+    );
+    std::fs::write(&config, &broken).expect("break the file by hand");
+    let refused = layout
+        .cli()
+        .args(["quickstart", "--restart", "--set", "floor.terminal", "on"])
+        .run();
+    assert_eq!(refused.code(), dudes::exit::OTHER, "{refused:?}");
+    assert!(
+        refused
+            .stderr
+            .contains(&format!("; {} was put back as it was", config.display())),
+        "{refused:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&config).expect("the operator file"),
+        broken,
+        "the file is as it was before quickstart"
+    );
+    assert_eq!(layout.daemons(), daemons, "nothing was started");
+    assert!(alive(daemons[0]), "the running daemon was not stopped");
+}
+
+/// A pseudo-terminal's leader side: everything the program wrote, and a way to type.
+struct Screen {
+    seen: Vec<u8>,
+    cursor: usize,
+    chunks: Receiver<Vec<u8>>,
+    keyboard: File,
+}
+
+impl Screen {
+    fn new(leader: OwnedFd) -> Self {
+        let keyboard = File::from(leader.try_clone().expect("share the leader"));
+        let mut reader = File::from(leader);
+        let (sender, chunks) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buffer = [0_u8; 4096];
+            while let Ok(read @ 1..) = reader.read(&mut buffer) {
+                if sender.send(buffer[..read].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            seen: Vec::new(),
+            cursor: 0,
+            chunks,
+            keyboard,
+        }
+    }
+
+    /// Wait until `text` appears after the last thing waited for.
+    fn expect(&mut self, text: &str) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Some(at) = self.seen[self.cursor..]
+                .windows(text.len())
+                .position(|window| window == text.as_bytes())
+            {
+                self.cursor += at + text.len();
+                return;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.chunks.recv_timeout(left) {
+                Ok(chunk) => self.seen.extend(chunk),
+                Err(error) => panic!(
+                    "`{text}` did not appear ({error}); the terminal shows:\n{}",
+                    String::from_utf8_lossy(&self.seen)
+                ),
+            }
+        }
+    }
+
+    fn answer(&mut self, line: &str) {
+        self.keyboard
+            .write_all(format!("{line}\n").as_bytes())
+            .expect("type on the terminal");
+    }
+
+    fn shown(&self) -> String {
+        String::from_utf8_lossy(&self.seen).replace("\r\n", "\n")
+    }
+}
+
+/// On a terminal with no options, each step is a question, and the answers give the same setup a
+/// script gets from options.
+#[test]
+fn a_terminal_is_asked_each_step_and_gets_the_same_setup() {
+    let layout = Layout::new();
+    let pty = nix::pty::openpty(
+        None::<&nix::pty::Winsize>,
+        None::<&nix::sys::termios::Termios>,
+    )
+    .expect("a pseudo-terminal");
+    let mut child = layout.cli().arg("quickstart").spawn_on_terminal(&pty.slave);
+    drop(pty.slave);
+    let mut screen = Screen::new(pty.master);
+
+    for (question, answer) in [
+        ("Turn on Codex? (providers.codex) [y/N]", "y"),
+        (
+            "Turn on Codex streaming? (providers.codex.streaming) [y/N]",
+            "",
+        ),
+        ("Turn on Pi? (providers.pi) [y/N]", ""),
+        (
+            "Answer an agent's question from the Floor? (floor.answer) [y/N]",
+            "y",
+        ),
+        ("Hire an agent from the Floor? (floor.hire) [y/N]", "y"),
+        (
+            "Pause, resume and rename an agent from the Floor? (floor.control) [y/N]",
+            "",
+        ),
+        (
+            "Attach a terminal to an agent from the Floor? (floor.terminal) [y/N]",
+            "",
+        ),
+        ("Set a spending cap (for API-key billing)? [y/N]", ""),
+        (
+            "Completion check (Enter to skip enrolling):",
+            "/usr/bin/true",
+        ),
+        (
+            "Name the check for the Floor [/usr/bin/true]:",
+            "README says hello",
+        ),
+        ("Hire a first agent now? [y/N]", "y"),
+        ("Name [Kim]:", ""),
+        ("Engine (claude, codex) [claude]:", "codex"),
+        (
+            "Goal (Enter to hire without one; an agent without a goal takes no turn):",
+            "",
+        ),
+        (
+            "Give this agent a spending cap (for API-key billing)? [y/N]",
+            "",
+        ),
+        ("and go ahead? [Y/n]", ""),
+    ] {
+        screen.expect(question);
+        screen.answer(answer);
+    }
+    screen.expect("hired ");
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("the child's status") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("quickstart did not exit:\n{}", screen.shown());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success(), "{status:?}:\n{}", screen.shown());
+    assert_set_up(&screen.shown(), &layout, true);
+    assert_written(&layout);
+}
+
+/// On a terminal, a running daemon is named before the operator confirms, with what a restart
+/// costs, and confirming restarts it.
+#[test]
+fn a_terminal_is_warned_before_a_restart() {
+    let layout = Layout::new();
+    let started = layout.cli().arg("quickstart").run();
+    assert_eq!(started.code(), dudes::exit::SUCCESS, "{started:?}");
+    let first = layout.daemons();
+
+    let pty = nix::pty::openpty(
+        None::<&nix::pty::Winsize>,
+        None::<&nix::sys::termios::Termios>,
+    )
+    .expect("a pseudo-terminal");
+    let mut child = layout.cli().arg("quickstart").spawn_on_terminal(&pty.slave);
+    drop(pty.slave);
+    let mut screen = Screen::new(pty.master);
+    for (question, answer) in [
+        ("Turn on Codex? (providers.codex) [y/N]", "y"),
+        (
+            "Turn on Codex streaming? (providers.codex.streaming) [y/N]",
+            "",
+        ),
+        ("Turn on Pi? (providers.pi) [y/N]", ""),
+        ("(floor.answer) [y/N]", ""),
+        ("(floor.hire) [y/N]", ""),
+        ("(floor.control) [y/N]", ""),
+        ("(floor.terminal) [y/N]", ""),
+        ("Set a spending cap (for API-key billing)? [y/N]", ""),
+        ("Completion check (Enter to skip enrolling):", ""),
+        ("Hire a first agent now? [y/N]", ""),
+    ] {
+        screen.expect(question);
+        screen.answer(answer);
+    }
+    screen.expect(
+        "A daemon is running. When its settings differ from the file, quickstart restarts it, \
+         which ends any turn it is running.",
+    );
+    screen.expect("and go ahead? [Y/n]");
+    screen.answer("");
+    screen.expect("Restarting the daemon so it reads");
+    let status = child.wait().expect("quickstart exits");
+    assert!(status.success(), "{status:?}:\n{}", screen.shown());
+    assert_eq!(layout.daemons().len(), 2, "{}", screen.shown());
+    assert!(!alive(first[0]), "the daemon with the old settings stopped");
+}
+
+/// The terminal's input ending is a stop: nothing is written and no daemon starts.
+#[test]
+fn a_terminal_that_ends_its_input_writes_nothing() {
+    let layout = Layout::new();
+    let pty = nix::pty::openpty(
+        None::<&nix::pty::Winsize>,
+        None::<&nix::sys::termios::Termios>,
+    )
+    .expect("a pseudo-terminal");
+    let mut child = layout.cli().arg("quickstart").spawn_on_terminal(&pty.slave);
+    drop(pty.slave);
+    let mut screen = Screen::new(pty.master);
+    screen.expect("Turn on Codex? (providers.codex) [y/N]");
+    // Control-D at the start of a line ends a terminal's input.
+    screen
+        .keyboard
+        .write_all(&[4])
+        .expect("type an end of input");
+    screen.expect("quickstart stopped at the end of its input; nothing was written");
+    let status = child.wait().expect("quickstart exits");
+    assert_eq!(status.code(), Some(i32::from(dudes::exit::USAGE)));
+    assert!(!layout.config().exists());
+    assert!(!layout.path("run").exists());
+}
+
+/// Answer the guided setup with every default: no engine beyond Claude, no Floor action, no cap,
+/// no workspace and no hire, then confirm.
+fn answer_the_defaults(screen: &mut Screen, codex: bool) {
+    for (question, answer) in [
+        (
+            "Turn on Codex? (providers.codex) [y/N]",
+            if codex { "y" } else { "" },
+        ),
+        ("Turn on Pi? (providers.pi) [y/N]", ""),
+        ("(floor.answer) [y/N]", ""),
+        ("(floor.hire) [y/N]", ""),
+        ("(floor.control) [y/N]", ""),
+        ("(floor.terminal) [y/N]", ""),
+        ("Set a spending cap (for API-key billing)? [y/N]", ""),
+        ("Completion check (Enter to skip enrolling):", ""),
+        ("Hire a first agent now? [y/N]", ""),
+        ("and go ahead? [Y/n]", ""),
+    ] {
+        screen.expect(question);
+        screen.answer(answer);
+        if codex && question == "Turn on Codex? (providers.codex) [y/N]" {
+            screen.expect("(providers.codex.streaming) [y/N]");
+            screen.answer("");
+        }
+    }
+}
+
+fn exit_status(child: &mut std::process::Child, screen: &Screen) -> std::process::ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(status) = child.try_wait().expect("the child's status") {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("the command did not exit:\n{}", screen.shown());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// **Quickstart's last act is the login offer**: after the Floor link it names each
+/// other engine still signed out, asks about one, and a yes replaces quickstart with that
+/// engine's own login, which holds the terminal, runs in the home without the agent names, and
+/// returns its own exit status.
+#[test]
+fn a_terminal_run_offers_one_login_last_and_the_login_replaces_quickstart() {
+    let layout = Layout::new();
+    layout.sign_out("claude");
+    layout.sign_out("codex");
+    let pty = nix::pty::openpty(
+        None::<&nix::pty::Winsize>,
+        None::<&nix::sys::termios::Termios>,
+    )
+    .expect("a pseudo-terminal");
+    let mut child = layout
+        .cli()
+        .env("DUDES_TOKEN", "not-an-agent")
+        .env("DUDES_SOCK", layout.socket())
+        .arg("quickstart")
+        .spawn_on_terminal(&pty.slave);
+    drop(pty.slave);
+    let mut screen = Screen::new(pty.master);
+    answer_the_defaults(&mut screen, true);
+
+    let claude = layout.path("engines/claude");
+    screen.expect(&format!(
+        "  claude: found at {}, signed out",
+        claude.display()
+    ));
+    screen.expect("#bootstrap=");
+    screen.expect("Codex is signed out. Sign in with: dudes login codex");
+    screen.expect(&format!(
+        "Sign in to Claude now? This runs {} auth login in this terminal. [y/N]",
+        claude.display()
+    ));
+    screen.answer("y");
+    let status = exit_status(&mut child, &screen);
+    assert_eq!(
+        status.code(),
+        Some(7),
+        "the login replaced quickstart and its status is the process's:\n{}",
+        screen.shown()
+    );
+    let home = layout.path("home").canonicalize().expect("the home");
+    assert_eq!(
+        std::fs::read_to_string(layout.path("claude-login")).expect("the login ran"),
+        format!("tty\n{}\nunset unset\n", home.display())
+    );
+    let runs = layout.engine_runs().unwrap_or_default();
+    assert_eq!(
+        runs.lines()
+            .filter(|line| line.contains("login") && !line.ends_with("status"))
+            .collect::<Vec<_>>(),
+        ["claude auth login"],
+        "exactly one login ran, and it was Claude's:\n{runs}"
+    );
+}
+
+/// No means no: the offer is declined, nothing runs, and quickstart ends well.
+#[test]
+fn a_declined_login_offer_runs_nothing() {
+    let layout = Layout::new();
+    layout.sign_out("claude");
+    let pty = nix::pty::openpty(
+        None::<&nix::pty::Winsize>,
+        None::<&nix::sys::termios::Termios>,
+    )
+    .expect("a pseudo-terminal");
+    let mut child = layout.cli().arg("quickstart").spawn_on_terminal(&pty.slave);
+    drop(pty.slave);
+    let mut screen = Screen::new(pty.master);
+    answer_the_defaults(&mut screen, false);
+    screen.expect("Sign in to Claude now?");
+    screen.answer("");
+    let status = exit_status(&mut child, &screen);
+    assert!(status.success(), "{status:?}:\n{}", screen.shown());
+    assert!(!layout.path("claude-login").exists(), "no login ran");
+    assert_only_status_checks(&layout);
+}
+
+/// `dudes login` runs nothing without a terminal, nothing for an engine already signed in, and
+/// only guidance for Pi; it prints the vendor command for the operator instead. A `signed_out`
+/// answer is asked again on the next call, so signing in shows at once.
+#[test]
+fn dudes_login_without_a_terminal_prints_the_command_and_runs_nothing() {
+    let layout = Layout::new();
+    layout.sign_out("claude");
+    let started = layout.cli().arg("quickstart").run();
+    assert_eq!(started.code(), dudes::exit::SUCCESS, "{started:?}");
+
+    let printed = layout.cli().args(["login", "claude"]).run();
+    assert_eq!(printed.code(), dudes::exit::SUCCESS, "{printed:?}");
+    assert_eq!(
+        printed.stdout,
+        format!(
+            "Sign in to Claude by running this in a terminal: {} auth login\n",
+            layout.path("engines/claude").display()
+        )
+    );
+
+    std::fs::remove_file(layout.path("claude-signed-out")).expect("sign in");
+    let signed_in = layout.cli().args(["login", "claude"]).run();
+    assert_eq!(signed_in.code(), dudes::exit::SUCCESS, "{signed_in:?}");
+    assert_eq!(
+        signed_in.stdout,
+        "The daemon reports Claude as signed in; nothing was run.\n"
+    );
+
+    let pi = layout.cli().args(["login", "pi"]).run();
+    assert_eq!(pi.code(), dudes::exit::SUCCESS, "{pi:?}");
+    assert_eq!(
+        pi.stdout,
+        "Pi signs in inside its own session: run pi, then type /login.\n"
+    );
+
+    let codex = layout.cli().args(["login", "codex"]).run();
+    assert_eq!(codex.code(), dudes::exit::OTHER, "{codex:?}");
+    assert_eq!(
+        codex.stderr,
+        "dudes: the daemon has no Codex engine; turn it on with dudes quickstart\n"
+    );
+    assert!(!layout.path("claude-login").exists(), "no login ran");
+    assert_only_status_checks(&layout);
+}
+
+/// On a terminal, `dudes login` replaces itself with the engine's own login.
+#[test]
+fn dudes_login_on_a_terminal_replaces_itself_with_the_login() {
+    let layout = Layout::new();
+    layout.sign_out("claude");
+    let started = layout.cli().arg("quickstart").run();
+    assert_eq!(started.code(), dudes::exit::SUCCESS, "{started:?}");
+    let pty = nix::pty::openpty(
+        None::<&nix::pty::Winsize>,
+        None::<&nix::sys::termios::Termios>,
+    )
+    .expect("a pseudo-terminal");
+    let mut child = layout
+        .cli()
+        .args(["login", "claude"])
+        .spawn_on_terminal(&pty.slave);
+    drop(pty.slave);
+    let mut screen = Screen::new(pty.master);
+    screen.expect(&format!(
+        "Running {} auth login.",
+        layout.path("engines/claude").display()
+    ));
+    let status = exit_status(&mut child, &screen);
+    assert_eq!(status.code(), Some(7), "{}", screen.shown());
+    assert!(
+        std::fs::read_to_string(layout.path("claude-login"))
+            .expect("the login ran")
+            .starts_with("tty\n"),
+        "the login holds the terminal"
+    );
+}
+
+fn answer_login_doctor(
+    root: &Path,
+    provider: serde_json::Value,
+) -> (Cli, std::thread::JoinHandle<()>) {
+    use std::io::BufRead as _;
+    let socket = root.join("doctor.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let client_home = root.join("client-home");
+    std::fs::create_dir(&client_home).unwrap();
+    let ping = serde_json::json!({"version": VERSION, "socket": socket, "lsn": 0});
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut request = String::new();
+        std::io::BufReader::new(&stream)
+            .read_line(&mut request)
+            .unwrap();
+        let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+        assert_eq!(request["method"], "system.doctor");
+        let reply = serde_json::json!({"jsonrpc":"2.0", "id":request["id"], "result":{"ping":ping,"providers":[provider]}});
+        writeln!(&stream, "{reply}").unwrap();
+    });
+    (Cli::new(&socket, root).env("HOME", client_home), server)
+}
+
+fn assert_managed_login_arguments(arguments: &[&str], home: &Path) {
+    assert_eq!(arguments.len(), 7);
+    assert_eq!(
+        &arguments[..5],
+        ["--disable", "hooks", "--disable", "plugins", "-c"]
+    );
+    assert_eq!(arguments[6], "login");
+    let config: toml_edit::DocumentMut = arguments[5].parse().unwrap();
+    let projects = config["projects"].as_inline_table().unwrap();
+    assert_eq!(projects.len(), home.ancestors().count());
+    for ancestor in home.ancestors() {
+        let entry = projects
+            .get(ancestor.to_str().unwrap())
+            .unwrap()
+            .as_inline_table()
+            .unwrap();
+        assert_eq!(
+            entry.get("trust_level").unwrap().as_str(),
+            Some("untrusted")
+        );
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn login_uses_the_daemons_home_and_preserves_legacy_environments() {
+    for (provider, managed) in [("codex", true), ("codex", false), ("claude", false)] {
+        let root = tempfile::tempdir().unwrap();
+        let program = root.path().join("Engine O'Brien;$HOME");
+        std::fs::write(&program, "#!/bin/sh\n{ printf '%s\\n' \"$CODEX_HOME\" \"${DUDES_TOKEN-unset}\" \"${DUDES_SOCK-unset}\"; pwd -P; printf '%s\\n' \"$@\"; } > \"$LOGIN_RESULT\"\nexit 7\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let managed_home = root.path().join("daemon sign-in's;$HOME");
+        std::fs::create_dir(&managed_home).unwrap();
+        let managed_home = managed_home.canonicalize().unwrap();
+        let client_home = root.path().join("client-codex-home");
+        let login_home = managed.then(|| serde_json::json!({"state":"ready", "path":managed_home}));
+        let (cli, server) = answer_login_doctor(
+            root.path(),
+            serde_json::json!({
+                "provider":provider, "command":program, "ok":true, "sign_in":"signed_out", "login_home":login_home
+            }),
+        );
+        let pty = nix::pty::openpty(
+            None::<&nix::pty::Winsize>,
+            None::<&nix::sys::termios::Termios>,
+        )
+        .unwrap();
+        let result = root.path().join("login-result");
+        let mut child = cli
+            .env("CODEX_HOME", &client_home)
+            .env("DUDES_TOKEN", "not-an-agent")
+            .env("LOGIN_RESULT", &result)
+            .args(["login", provider])
+            .spawn_on_terminal(&pty.slave);
+        drop(pty.slave);
+        let mut screen = Screen::new(pty.master);
+        screen.expect("Running ");
+        assert_eq!(
+            exit_status(&mut child, &screen).code(),
+            Some(7),
+            "{}",
+            screen.shown()
+        );
+        server.join().unwrap();
+        let written = std::fs::read_to_string(result).unwrap();
+        let lines: Vec<_> = written.lines().collect();
+        let expected_home = if managed { &managed_home } else { &client_home };
+        assert_eq!(lines[0], expected_home.to_str().unwrap());
+        assert_eq!(&lines[1..3], ["unset", "unset"]);
+        let expected_cwd = if managed {
+            managed_home.clone()
+        } else {
+            root.path().join("client-home").canonicalize().unwrap()
+        };
+        assert_eq!(lines[3], expected_cwd.to_str().unwrap());
+        if managed {
+            assert_managed_login_arguments(&lines[4..], &managed_home);
+        } else if provider == "claude" {
+            assert_eq!(&lines[4..], ["auth", "login"]);
+        } else {
+            assert_eq!(&lines[4..], ["login"]);
+        }
+    }
+}
+
+#[test]
+fn codex_login_refuses_unavailable_or_invalid_home_even_when_signed_in() {
+    for login_home in [
+        serde_json::json!({"state":"unavailable","reason":"managed profile unavailable"}),
+        serde_json::json!({"state":"ready","path":"relative-home"}),
+        serde_json::json!({"state":"ready","path":"/tmp/../other-home"}),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let (cli, server) = answer_login_doctor(
+            root.path(),
+            serde_json::json!({
+                "provider":"codex", "command":"/unused/codex", "ok":true, "sign_in":"signed_in", "login_home":login_home
+            }),
+        );
+        let result = cli.args(["login", "codex"]).run();
+        server.join().unwrap();
+        assert_eq!(result.code(), dudes::exit::OTHER, "{result:?}");
+        assert!(
+            !result.stdout.contains("signed in; nothing was run"),
+            "{result:?}"
+        );
+    }
+}
+
+#[test]
+fn legacy_signed_in_login_keeps_the_no_run_shortcut_without_a_home_report() {
+    let root = tempfile::tempdir().unwrap();
+    let (cli, server) = answer_login_doctor(
+        root.path(),
+        serde_json::json!({
+            "provider":"codex", "ok":false, "sign_in":"signed_in"
+        }),
+    );
+    let result = cli.args(["login", "codex"]).run();
+    server.join().unwrap();
+    assert_eq!(result.code(), dudes::exit::SUCCESS, "{result:?}");
+    assert_eq!(
+        result.stdout,
+        "The daemon reports Codex as signed in; nothing was run.\n"
+    );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn printed_codex_login_command_preserves_the_literal_program_and_home() {
+    let root = tempfile::tempdir().unwrap();
+    let program = root.path().join("Codex O'Brien;$(false)");
+    std::fs::write(
+        &program,
+        "#!/bin/sh\nprintf '%s\\n' \"$CODEX_HOME\"\npwd -P\nprintf '%s\\n' \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let managed_home = root.path().join("daemon O'Brien;$(false)");
+    std::fs::create_dir(&managed_home).unwrap();
+    let managed_home = managed_home.canonicalize().unwrap();
+    let (cli, server) = answer_login_doctor(
+        root.path(),
+        serde_json::json!({
+            "provider":"codex", "command":program, "ok":true, "sign_in":"signed_out",
+            "login_home":{"state":"ready","path":managed_home}
+        }),
+    );
+    let result = cli.args(["login", "codex"]).run();
+    server.join().unwrap();
+    assert_eq!(result.code(), dudes::exit::SUCCESS, "{result:?}");
+    let command = result
+        .stdout
+        .strip_prefix("Sign in to Codex by running this in a terminal: ")
+        .unwrap()
+        .trim_end();
+    let executed = run_program(Path::new("/bin/sh"), &["-c".into(), command.into()]);
+    assert_eq!(executed.code(), 0, "{executed:?}");
+    let lines: Vec<_> = executed.stdout.lines().collect();
+    assert_eq!(
+        &lines[..2],
+        [
+            managed_home.to_str().unwrap(),
+            managed_home.to_str().unwrap()
+        ]
+    );
+    assert_managed_login_arguments(&lines[2..], &managed_home);
+}
+
+/// Options ask nothing, even on a terminal: no login question and no browser. Quickstart prints
+/// the commands instead.
+#[test]
+fn options_on_a_terminal_ask_nothing_and_print_the_commands() {
+    let layout = Layout::new();
+    layout.sign_out("claude");
+    let pty = nix::pty::openpty(
+        None::<&nix::pty::Winsize>,
+        None::<&nix::sys::termios::Termios>,
+    )
+    .expect("a pseudo-terminal");
+    let mut child = layout
+        .cli()
+        .args(["quickstart", "--yes"])
+        .spawn_on_terminal(&pty.slave);
+    drop(pty.slave);
+    let mut screen = Screen::new(pty.master);
+    screen.expect("Open the Floor with: dudes floor open");
+    screen.expect("Claude is signed out. Sign in with: dudes login claude");
+    let status = exit_status(&mut child, &screen);
+    assert!(status.success(), "{status:?}:\n{}", screen.shown());
+    let shown = screen.shown();
+    for absent in ["now? [y/N]", "#bootstrap=", "opening no browser"] {
+        assert!(!shown.contains(absent), "`{absent}` in:\n{shown}");
+    }
+    assert!(!layout.path("claude-login").exists(), "no login ran");
+}
+
+#[test]
+fn setup_escapes_every_mailbox_diagnostic_filename() {
+    let layout = Layout::new();
+    let started = layout
+        .cli()
+        .args([
+            "quickstart",
+            "--set",
+            "providers.codex",
+            "on",
+            "--enroll",
+            "--hire",
+            "Mail",
+            "--provider",
+            "codex",
+            "--",
+            "/usr/bin/true",
+        ])
+        .run();
+    assert_eq!(started.code(), dudes::exit::SUCCESS, "{started:?}");
+    let reader = dudes_journal::Reader::new(&layout.path("state/journal"));
+    let agent = reader
+        .iter_from(dudes_types::Lsn::ZERO)
+        .unwrap()
+        .find_map(|entry| match entry.unwrap().1.record {
+            dudes_proto::Record::AgentHired { id, .. } => Some(id),
+            _ => None,
+        })
+        .expect("a hired agent");
+    let done = layout.path(&format!("state/agents/{agent}/inbox/.done"));
+    std::fs::create_dir_all(&done).unwrap();
+    let filename = "marker\u{1b}]52;clipboard\nforged";
+    std::fs::write(done.join(filename), "unread content").unwrap();
+    let agents = layout.cli().args(["--json", "agents"]).run();
+    assert_eq!(agents.code(), dudes::exit::SUCCESS, "{agents:?}");
+    assert!(agents.stdout.contains(&agent.to_string()), "{agents:?}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let result = loop {
+        let result = layout
+            .cli()
+            .args(["quickstart", "--set", "providers.codex", "on"])
+            .run();
+        if result
+            .stdout
+            .contains("marker\\u{1b}]52;clipboard\\u{a}forged")
+        {
+            break result;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "mailbox diagnostics did not appear: {result:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(result.code(), dudes::exit::SUCCESS, "{result:?}");
+    assert!(
+        result
+            .stdout
+            .contains("marker\\u{1b}]52;clipboard\\u{a}forged"),
+        "{result:?}"
+    );
+    assert!(!result.stdout.contains('\u{1b}'), "{result:?}");
+    assert!(!result.stdout.contains("unread content"), "{result:?}");
+}

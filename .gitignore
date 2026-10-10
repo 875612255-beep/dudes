@@ -1,0 +1,18 @@
+/target
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+**/*.rs.bk
+/floor/node_modules
+/floor/out
+/floor/dist
+.DS_Store
+
+# local-only (Claude Code convention)
+CLAUDE.local.md
+.claude/settings.local.json
+.claude/worktrees/
+
+# secrets never enter the repo
+.env
+.env.*

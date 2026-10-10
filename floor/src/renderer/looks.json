@@ -1,0 +1,15 @@
+{
+  "characters": ["c", "d", "e", "f", "g", "h", "i", "j", "k", "l"],
+  "looks": [
+    { "skin": "#f0c9a6", "hair": "#3a2a22", "style": "short", "pants": "#3b4a6b" },
+    { "skin": "#d9a77f", "hair": "#7a4b2a", "style": "long", "pants": "#4a4a52" },
+    { "skin": "#f2d3b5", "hair": "#1d1d22", "style": "short", "pants": "#2d3640" },
+    { "skin": "#f2d3b5", "hair": "#c9a26b", "style": "bun", "pants": "#5a4636" },
+    { "skin": "#a8754f", "hair": "#2a2a2a", "style": "short", "pants": "#3b4a6b" },
+    { "skin": "#e8b98f", "hair": "#6b3b2a", "style": "long", "pants": "#4a4a52" },
+    { "skin": "#c68b5e", "hair": "#1d1d22", "style": "bun", "pants": "#2d3640" },
+    { "skin": "#f2d3b5", "hair": "#d8b25a", "style": "short", "pants": "#5a4636" },
+    { "skin": "#8d5b3b", "hair": "#141416", "style": "long", "pants": "#4a4a52" },
+    { "skin": "#e8c3a0", "hair": "#b5523b", "style": "short", "pants": "#3b4a6b" }
+  ]
+}

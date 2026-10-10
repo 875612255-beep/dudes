@@ -1,0 +1,33 @@
+[package]
+name = "dudes-proto"
+description = "The Dudes contract: Event, HookReply, journal Record, RPC types, floor projection, vendor payloads; exported as JSON Schema."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+# Exposes `record::samples` to dependents' tests; taken as a dev-dependency only.
+#
+# The `unstable-` prefix is load-bearing, not decoration. cargo-semver-checks builds a heuristic
+# feature set that turns features on, skipping only those named `unstable`, `nightly`, `bench` or
+# `no_std`, or prefixed `_`, `unstable-` or `unstable_`. Under any other name these fixtures would
+# be enabled during the comparison and become contract items — the opposite of the point.
+unstable-testing = []
+
+[dependencies]
+dudes-types = { workspace = true, features = ["std"] }
+schemars = { workspace = true, features = ["std"] }
+serde = { workspace = true, features = ["std"] }
+serde_json.workspace = true
+subtle.workspace = true
+
+[dev-dependencies]
+jsonschema.workspace = true
+
+[lints]
+workspace = true

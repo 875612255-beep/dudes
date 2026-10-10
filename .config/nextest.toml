@@ -1,0 +1,48 @@
+# nextest settings for this workspace.
+#
+# # `leak-timeout`, and why it is not the shipped 100 ms
+#
+# nextest calls a test *leaky* when the pipe it handed that test's process has not reached
+# end-of-file within `leak-timeout` of the process exiting. The number is therefore a claim about
+# **how long this runner may take to observe the close** — not a claim about the code under test.
+# At 100 ms that claim is false on a loaded machine, and the verdict it then produces names an
+# arbitrary test, so a reader chasing it starts in a file that has nothing to do with it.
+#
+# Measured on `dudes-host`, aarch64-apple-darwin, cargo-nextest 0.9.143, 8 cores with other builds
+# running. `--test-threads` unstated means nextest's default of one per core.
+#
+# | Condition                                       | leak-timeout | Runs | Leaky      |
+# | --                                              | --           | --   | --         |
+# | `-p dudes-host`                                 | 100 ms       | 150  | 4  (2.7 %) |
+# | the same, every child's stdio at `/dev/null`    | 100 ms       | 150  | 3  (2.0 %) |
+# | the same, `-j 1` beside a parallel run of it    | 100 ms       |  30  | 0          |
+# | the same, `--test-threads 64`                   | 100 ms       |  60  | 9  (15 %)  |
+# | the same, `--test-threads 64`                   | 1 s          |  60  | 3  (5 %)   |
+# | the same, `--test-threads 64`                   | 5 s          |  60  | 0          |
+#
+# Row two is the one that settles what is being measured. With every child's standard output and
+# standard error redirected to the null device, no descendant of any test can hold a pipe at all —
+# and the rate does not move. The verdict is not reporting a held pipe.
+#
+# Row three separates contention from concurrency: that serial run shared the machine with a second
+# nextest running the same suite in parallel, and saw everything the parallel one saw except its
+# own tests overlapping. It did not leak; the parallel one beside it did, twice in 92 runs.
+#
+# Row four is the control that makes it fail on demand, and under it six of the nine verdicts named
+# a test that spawns no process, four of them `kill::tests::*`, which run against a scripted target
+# and touch no process table. That is how a correct diagnosis ends up pointing at the wrong file.
+# `crates/dudes-host/tests/common/mod.rs` owns the long form of the explanation, because that is
+# the harness a reader arrives at from any of the tests that get named.
+#
+# Five seconds is where the control goes clean, and the last two rows are why it is not one second.
+# It costs nothing when nothing leaks — the wait happens only when end-of-file has not arrived —
+# and it gives up nothing that matters: a leaked process holds the pipe for as long as it lives, so
+# no finite threshold lets one through, while a child outliving its test by more than five seconds
+# is still reported. What the threshold cannot be is a bound on the runner's scheduling, which is
+# unbounded; it can only be set far enough past it to stop reading as a defect in the tests.
+[profile.default]
+leak-timeout = "5s"
+
+[[profile.default.overrides]]
+filter = 'package(=dudes) & binary(=quickstart) & test(=capture_timeout_reaps_a_retained_handle_daemon_at_an_alternate_root)'
+threads-required = "num-test-threads"

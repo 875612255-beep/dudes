@@ -1,0 +1,39 @@
+[package]
+name = "dudes-journal"
+description = "The Dudes journal: framed append-only log with fsync'd appends, torn-tail repair, replay and redb projections."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+blake3.workspace = true
+crc.workspace = true
+dudes-proto.workspace = true
+dudes-types = { workspace = true, features = ["std"] }
+redb.workspace = true
+serde = { workspace = true, features = ["std"] }
+serde_json.workspace = true
+thiserror = { workspace = true, features = ["std"] }
+tracing.workspace = true
+tempfile.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# The applied-memory body store uses rustix's safe *at wrappers so every descendant create,
+# open, link and unlink stays relative to an already-validated state-directory descriptor.
+# The same feature supplies the test-only umask proof without a second dependency edge.
+rustix = { workspace = true, features = ["fs"] }
+
+[dev-dependencies]
+# `record::samples::record` for the "every kind round-trips as an `Entry`" table.
+# Dev only, and the feature's `unstable-` prefix is what keeps those fixtures out of the
+# contract surface cargo-semver-checks compares — see the note in dudes-proto's manifest.
+dudes-proto = { workspace = true, features = ["unstable-testing"] }
+proptest.workspace = true
+
+[lints]
+workspace = true

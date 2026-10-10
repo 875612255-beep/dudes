@@ -1,0 +1,40 @@
+#!/bin/sh
+# A Pi stand-in for the daemon tests: `pi --mode json` output with no account behind it.
+#
+# Each run appends a `run` line, whether stdin is a character device, and then its argv, one
+# element per line, to $DUDES_PI_STAND_IN_LOG. A new session writes its file into --session-dir and
+# prints the captured l3-turn1 run. `--session <id>` succeeds only when --session-dir holds that
+# session's file, and otherwise fails as Pi does. It then prints the captured l2-tool run under this
+# session's id, because each of that run's token counts is at or above l3-turn1's, so a running
+# total would be charged less than the whole figure.
+set -eu
+
+session=3d8f310f-9cb5-7185-a385-54c0378f2355
+{
+    printf 'run\n'
+    if [ -c /dev/stdin ]; then printf 'stdin=chardev\n'; else printf 'stdin=other\n'; fi
+    printf '%s\n' "$@"
+} >>"$DUDES_PI_STAND_IN_LOG"
+
+dir=
+resume=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+    --session-dir) dir=$2; shift 2 ;;
+    --session) resume=$2; shift 2 ;;
+    --) break ;;
+    *) shift ;;
+    esac
+done
+
+if [ -n "$resume" ]; then
+    if [ ! -f "$dir/stand-in_$resume.jsonl" ]; then
+        printf "No session found matching '%s'\n" "$resume" >&2
+        exit 1
+    fi
+    sed "1s/\"id\":\"[^\"]*\"/\"id\":\"$session\"/" "$DUDES_PI_FIXTURES/l2-tool.jsonl"
+else
+    mkdir -p "$dir"
+    : >"$dir/stand-in_$session.jsonl"
+    cat "$DUDES_PI_FIXTURES/l3-turn1.jsonl"
+fi

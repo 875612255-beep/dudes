@@ -1,0 +1,28 @@
+# Fuzz targets for the journal frame codec. Its own workspace (see `exclude` in the root
+# Cargo.toml): needs nightly and `-Zsanitizer`, and the libFuzzer runtime carries a licence the
+# root allow list does not. Never shipped. Run: `cargo +nightly fuzz run journal_frame --fuzz-dir fuzz`.
+[package]
+name = "dudes-journal-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+dudes-journal = { path = "../crates/dudes-journal" }
+
+[[bin]]
+name = "journal_frame"
+path = "fuzz_targets/journal_frame.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+
+[profile.release]
+debug = 1

@@ -1,0 +1,5 @@
+# Pinned toolchain; CI parses `channel` from this file. Bump deliberately, in its own commit.
+[toolchain]
+channel = "1.98.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

@@ -1,0 +1,6 @@
+# Stable options only: anything that needs nightly would break `cargo fmt --check` on the pinned toolchain.
+style_edition = "2024"
+max_width = 100
+newline_style = "Unix"
+use_field_init_shorthand = true
+use_try_shorthand = true

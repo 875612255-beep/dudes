@@ -1,0 +1,21 @@
+[package]
+name = "dudes-hook"
+description = "The synchronous Dudes hook shim: one vendor payload in, one typed local call, one vendor reply out."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = false
+[dependencies]
+dudes-proto.workspace = true
+dudes-rpc.workspace = true
+serde_json.workspace = true
+[dev-dependencies]
+dudes-host.workspace = true
+tempfile.workspace = true
+[lints]
+workspace = true

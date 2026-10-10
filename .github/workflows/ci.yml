@@ -1,0 +1,180 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo fmt --all --check
+      - name: dudes-types builds without its default feature
+        run: cargo check -p dudes-types --no-default-features --locked
+      - run: cargo xtask layering --strict
+      - run: cargo xtask schemas --check
+      - run: cargo xtask naming
+
+  clippy:
+    name: clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows tests run on the weekly and manual runs only, until the Windows port's known test
+        # failures are fixed. Windows clippy still runs on every pull request.
+        os: >-
+          ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+              && fromJSON('["ubuntu-latest","macos-latest","windows-latest"]')
+              || fromJSON('["ubuntu-latest","macos-latest"]') }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run --workspace --locked --no-fail-fast
+      - run: cargo nextest run --locked -p duded --features stub-provider --bin duded
+        if: ${{ !cancelled() }}
+      - name: Closing-time before-spawn crash recovery
+        if: ${{ !cancelled() && runner.os != 'Windows' }}
+        run: >-
+          cargo nextest run --locked -p duded --features fault-injection --test closing_time
+          -E 'test(a_real_before_spawn_crash_reissues_the_same_durable_saving_turn_once)'
+          --no-fail-fast --no-tests=fail
+      - run: cargo test --workspace --doc --locked
+        if: ${{ !cancelled() }}
+      - name: Chrome pipe smoke
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        env:
+          DUDES_SMOKE_REQUIRE_CHROME: "1"
+        run: |
+          set -o pipefail
+          node --test --test-reporter=tap --test-name-pattern='Chrome drives the page over pipes without a DevTools TCP endpoint' xtask/src/smoke.test.mjs | tee "$RUNNER_TEMP/chrome-pipe-smoke.tap"
+          grep -E '^ok [0-9]+ - Chrome drives the page over pipes without a DevTools TCP endpoint$' "$RUNNER_TEMP/chrome-pipe-smoke.tap"
+
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: msrv
+        run: |
+          msrv=$(sed -nE 's/^rust-version *= *"([^"]+)".*/\1/p' Cargo.toml)
+          test -n "$msrv" || { echo "Cargo.toml has no workspace rust-version" >&2; exit 1; }
+          echo "version=$msrv" >> "$GITHUB_OUTPUT"
+      - run: rustup toolchain install "$MSRV" --profile minimal
+        env:
+          MSRV: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The environment variable outranks rust-toolchain.toml.
+      - run: cargo check --workspace --all-targets --locked
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
+
+  deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-deny
+      - run: cargo deny --locked check
+
+  floor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: floor
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24.21.0"
+          package-manager-cache: false
+      # The Floor tests read the workspace through `cargo metadata`.
+      - run: rustup toolchain install
+      - name: Verify runtime versions
+        run: |
+          test "$(node --version)" = "v24.21.0"
+          test "$(npm --version)" = "11.19.0"
+      - run: npm ci --ignore-scripts
+      - run: npm run check:licenses
+      - run: npm run typecheck
+      - run: npm test
+      - name: Pi MCP extension unit tests
+        working-directory: .
+        run: node --test crates/dudes-providers/src/pi/mcp-extension.test.mjs
+
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo xtask gate

@@ -1,0 +1,23 @@
+[package]
+name = "dudes-providers"
+description = "Provider adapters of the Dudes supervisor: launch specs, stream-line parsing, turn outcome and usage accounting. Pure: no process, no I/O, no clock."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+dudes-proto.workspace = true
+dudes-types = { workspace = true, features = ["std"] }
+serde = { workspace = true, features = ["std"] }
+serde_json.workspace = true
+thiserror = { workspace = true, features = ["std"] }
+# Codex takes each declared MCP server as one `-c` TOML value, written by the serializer.
+toml = { workspace = true, features = ["display"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,43 @@
+[package]
+name = "dudes-types"
+description = "Vocabulary of the Dudes supervisor: ids, enums, provenance, money. No I/O, no clock."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = ["std"]
+# Without `std` the crate is `no_std` + `alloc`: the same types, the same wire format.
+#
+# `ulid/std` is deliberately not forwarded. It is `dep:rand` (ulid 3.0.0), so forwarding it puts a
+# random source reachable from the pure loop in the normal graph — which invariant 5 forbids and
+# `cargo xtask layering` checks on two rows, not one. Restored, the gate reports four violations and
+# the `dudes-types` row fires first: this manifest is where the forward is decided, so its row is
+# the enforcement point one hop before `dudes-policy`, where the breach is observed.
+#
+# The feature gates more than the RNG, and each of the four things behind it was checked rather than
+# assumed: `impl std::error::Error` for `EncodeError`/`DecodeError`, `base32::encode` (and so the
+# inherent `Ulid::to_string`), `From<Ulid> for String`, and the `generator`/`time` modules that mint
+# ids. This crate uses none of them. It mints nothing (`from_parts`, `from_string`, `from_bytes`,
+# `nil` only), renders through `fmt::Display for Ulid` and `array_to_str`, which are `core`-only and
+# ungated, and converts `DecodeError` by matching its two variants by hand — a `From` impl, not a
+# `#[source]` field, so nothing here needs `DecodeError: std::error::Error`.
+std = ["serde/std", "schemars/std", "thiserror/std"]
+
+[dependencies]
+schemars.workspace = true
+serde = { workspace = true, features = ["alloc"] }
+thiserror.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+regex.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

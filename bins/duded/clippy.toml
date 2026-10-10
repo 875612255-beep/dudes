@@ -1,0 +1,33 @@
+# Within `bins/duded`, `std::process::Command` is disallowed outright, with no
+# allow-listed module. Every child in this process — an agent child through `ProcessHost`, a goal
+# predicate's child through the one-shot runner — is created by `dudes-host` and by nothing else,
+# which is invariant 10's "every child is owned" enforced by a gate rather than by convention.
+#
+# No exception, deliberately. An allow-listed module is a permanent blind spot exactly its own
+# size, and everything later added to it inherits the exemption silently.
+#
+# The known cost, which `crates/dudes-policy/clippy.toml` documents at the same place: clippy reads
+# exactly one configuration file, so this one replaces the workspace's for this crate and the
+# workspace keys are repeated below; keep them in step with /clippy.toml.
+#
+# Two things this does **not** reach, both worth knowing before trusting it.
+#
+# 1. **It bans a *type*, not a *capability***. A third-party spawn crate constructs
+#    the command internally and passes. The complement that acts on the dependency is this package's
+#    `cargo xtask layering` row; the complete one is `cargo deny`'s ban list.
+#
+# 2. **It governs this crate and no other.** The intended scope is "within `bins/duded` *and
+#    every crate it depends on except `dudes-host`*", and clippy resolves one configuration file per
+#    crate being linted by walking up from *that crate's* manifest — so `dudes-rpc`,
+#    `dudes-supervisor`, `dudes-providers`, `dudes-journal`, `dudes-types` and `dudes-proto` are
+#    linted against the root `/clippy.toml`, which carries no `disallowed-types`. The rule is
+#    therefore implemented at one eighth of its intended scope. Latent rather than live today —
+#    `std::process::Command` appears in no crate but `dudes-host` — and the intent is
+#    to narrow the ban to this crate rather than add six more configuration files. Written
+#    here so the gate does not read as covering more than it does.
+disallowed-types = ["std::process::Command"]
+
+# Workspace keys (see /clippy.toml).
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+avoid-breaking-exported-api = false

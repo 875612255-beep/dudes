@@ -1,0 +1,87 @@
+[package]
+name = "dudes-host"
+description = "Every child process Dudes creates: the real ProcessHost, which owns each agent child in a process group or job object, reads its adoption key at spawn and re-validates it before each signal; and the one-shot runner, which owns a goal predicate's child for the length of one bounded run."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+# A root path patch is not preserved in published crate metadata. Keep this crate unpublished
+# while its required safe libproc API exists only in vendor/libproc.
+publish = false
+
+[dependencies]
+dudes-providers.workspace = true
+dudes-supervisor.workspace = true
+tracing.workspace = true
+
+# Every platform dependency is gated to the platform that uses it, so no CI leg builds a toolchain
+# it has no use for — libproc in particular wants libclang wherever it is built.
+
+[target.'cfg(unix)'.dependencies]
+# The signals and the process-group query, safely: no `unsafe` is needed on either Unix platform.
+rustix.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# The macOS start value: `proc_pidinfo` + `BSDInfo`, whose `pbi_start_tvsec`/`pbi_start_tvusec` are
+# the platform-native creation time.
+libproc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# Creator-only agent directories and settings files. The Win32 calls stay inside the
+# DACL/filesystem-only leaf: the runtime directory has a second, narrow creator here.
+dudes-win.workspace = true
+# Job objects with kill-on-close, so every descendant dies with the daemon (invariant 10).
+win32job.workspace = true
+# Process identity, waiting, termination and the injected named-pipe disconnect leaf. DACL and
+# filesystem calls live in `dudes-win`, so a consumer of that leaf cannot reach this crate's
+# job/process ownership surface.
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+# The process-group assertions ask the kernel directly rather than asking the code under test.
+# `fs` is on top of the workspace's `process`, and only here: `umask(2)` lives in `rustix::process`
+# but is gated on `fs`, and one mode test forces the umask so that the creation-time mode on
+# `mkdir(2)` is observable at all. Dev-only, so nothing about the shipped surface moves — the
+# workspace table's "`process` only" still describes every build that is not a test. Declared
+# rather than borrowed: `tempfile` already enables `fs` in this graph, and a test leaning on a
+# feature another crate happens to want is a test that breaks when that crate stops wanting it.
+rustix = { workspace = true, features = ["fs"] }
+
+# the workspace lints table, copied whole, with exactly three deltas — `unsafe_code`
+# `forbid` -> `deny`, plus the two `deny` lines below. The copy is forced, not stylistic: Cargo
+# rejects a `[lints]` table that both sets `workspace = true` and adds entries, and `forbid` cannot
+# be re-levelled from source, so a crate that inherits the workspace table can hold no `unsafe` at
+# all. The grant this buys is one module on one platform — `src/windows.rs`, which carries the only
+# `#[allow(unsafe_code)]` in the crate — and `tests/unsafe_grant.rs` is what fails when it spreads.
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+undocumented_unsafe_blocks = "deny"
+dbg_macro = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+todo = "warn"
+unimplemented = "warn"

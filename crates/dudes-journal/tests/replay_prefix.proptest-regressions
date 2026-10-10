@@ -1,0 +1,29 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 7f24acea88419e963a00b0bc5fc71e600a338bb5e594ef8490a60bfc0a09ab99 # shrinks to ops = [Hire, SetGoal(0), Hire, SetGoal(0), Spawn(0, false), Hire, Detach(0), Answer(0), Decide(2, 1), Decide(2, 3), Reassign(0, 0), Beat(3, 0), Noise(2), Pause(3), Beat(2, 3), Halt(3), Pause(0), Beat(4, 2)], cut = Index(9069371650623153864)
+cc 51f9154a71bb3b3331cfdc24888a863cd4ed288087528157a46ef044089a92f0 # shrinks to ops = [Hire, SetGoal(0), Issue(0, false), Retire(0)], cut = Index(0)
+# The seed below did not fail on shipped code: it is the shrunk `Vanished`-at-the-tail case,
+# recorded under a deliberate mutation that made an end with no usage charge the day row.
+# Kept because re-running it is free and it is the smallest vector that reaches that path.
+cc d0bea4d3fc3dca9a7f5abf15d3ece4dde1f7501c28d1bcc63f6051ea83de74f8 # shrinks to ops = [Hire, SetGoal(0), Issue(0, false), End(0, 3)], cut = Index(0)
+# recorded under a deliberate mutation that made `TurnSpawned` write the agent's session, the
+# fourth writer `only_session_learned_writes_the_agents_session` now names. Kept for the same
+# reason as the entry above: it is the smallest vector that reaches a spawn carrying a session.
+cc a22fae1c14a7f1a123509936dc40597f6aa6795e85c16ae34c0002d9128dced2 # shrinks to ops = [Hire, Hire, Hire, Hire, SetGoal(1), Retire(4), Hire, Issue(4, false), Spawn(4, true)], cut = Index(0)
+# A non-empty `ops` that expands to **no** entries: `Retire` before any hire has no subject, so
+# `expand` drops it. `the_export_agrees_between_a_live_fold_and_a_replay` takes a one-record prefix
+# for its control and subtracted from an empty vector. Kept so the `prop_assume!` that answers it
+# is exercised on every run rather than only when the generator happens to produce this shape.
+cc c65887e3274b08aa44db20a1c47a2079e92e0df92793adff54858612f8283cec # shrinks to ops = [Retire(0)]
+# A log with records in it whose projection holds **no rows**: the hire writes an agent row and the
+# retire deletes it, so the export is legitimately its two header lines. It falsified the first form
+# of `the_export_agrees_between_a_live_fold_and_a_replay`'s second control, which asserted the
+# export had more than two lines on the assumption that a non-empty log always projects a row. Kept
+# because the replacement — line count equals the rows the typed accessors report — has to keep
+# holding on exactly this shape.
+cc a8cbad03560b7d370530487a7307e5d2b40a0773896279d0ceb914d3d523fa19 # shrinks to ops = [Hire, Retire(0)]
+cc 65dfa88535780142e2dde2feecc715d1afdf551fa931c29ceb9cc4f19bd2ca8d # shrinks to ops = [Hire, Hire, Hire, SetGoal(2), Decide(2, 1), Issue(2, false), End(2, 0), Hire], cut = Index(0)

@@ -1,0 +1,199 @@
+# Dudes — virtual workspace.
+#
+# Every member inherits [workspace.package], [workspace.dependencies] and [workspace.lints].
+# Crates live in crates/ (libraries), bins/ (daemon, CLI, hook shim) and xtask/ (repo automation).
+
+[workspace]
+resolver = "3"
+members = ["crates/*", "bins/*", "xtask"]
+# `fuzz/` is its own workspace: it needs nightly and a libFuzzer runtime whose licence is not on the
+# allow list, and it never ships. Kept outside the graph so `cargo deny` and `clippy` never see it.
+exclude = ["fuzz", "vendor/libproc"]
+# Cargo rejects a glob that matches nothing. Every member needs a `cargo xtask layering` row, and its
+# directory must be in the naming gate's `ROOTS`, or the gate never walks it and passes silently.
+
+[workspace.package]
+version = "0.79.0"
+edition = "2024"
+# MSRV policy: two stable releases behind the pinned toolchain at the time of a release; a bump is a
+# minor change (see CONTRIBUTING.md). Tested by the `msrv` CI job.
+rust-version = "1.96.0"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/ArcfluxResearch/dudes"
+keywords = ["agents", "supervisor", "coding-agent", "cli"]
+categories = ["development-tools", "command-line-utilities"]
+
+[workspace.dependencies]
+# Core vocabulary; versions verified on crates.io on 2026-08-22.
+anyhow = "1.0.104"
+# `default-features = false` here so a `no_std` member can opt out; std members add `features = ["std"]`.
+serde = { version = "1.0.229", default-features = false, features = ["derive"] }
+serde_json = "1.0.151"
+# Restart-loaded operator configuration; fixed-point money is read from the parsed source span.
+toml = { version = "1.1.5", default-features = false, features = ["std", "parse", "serde"] }
+# The CLI edits the operator's hand-written config in place without disturbing its other text and
+# comments. Same maintainers as `toml`; MIT OR Apache-2.0.
+toml_edit = { version = "0.25.13", default-features = false, features = ["parse", "display"] }
+schemars = { version = "1.2.2", default-features = false, features = ["derive"] }
+proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
+syn = { version = "3.0.3", features = ["full", "visit"] }
+thiserror = { version = "2.0.20", default-features = false }
+tracing = "0.1.44"
+ulid = { version = "3.0.0", default-features = false }
+# The daemon's Floor listener owns I/O and bounds before handing a complete request head to this
+# parser. No runtime or server framework enters `duded` through it. MIT OR Apache-2.0.
+httparse = { version = "1.10.1", default-features = false }
+# SHA-256 binds each served Floor asset and the canonical release tree. Defaults are unnecessary:
+# the daemon uses only the fixed digest and needs neither OIDs nor allocation support from the crate.
+sha2 = { version = "0.11.0", default-features = false }
+# The operating system's entropy, named rather than inherited. Every id and every secret the daemon
+# mints comes from here: `ulid`'s own `rand` feature would do it too, but it arrives through feature
+# unification and a *security* property must not rest on which other crate happened to turn a
+# feature on. Already in this graph (`tempfile`, `rand`); MIT OR Apache-2.0, both on the allow list.
+getrandom = "0.4.3"
+# Constant-time equality for secrets — the hook token and the operator credential, which share one
+# implementation of it in `dudes-proto::rpc::secret`.
+subtle = { version = "2.6.1", default-features = false }
+# `pty.write` carries the attacher's keystrokes as base64, so the one place that decodes them is
+# the conditioned route in `dudes-rpc`. It is decoded, not hand-rolled, for a correctness reason:
+# the daemon digests the *decoded* bytes into `PtyWriteRequested.payload`, so a decoder that
+# admitted two spellings of one byte string would make that digest ambiguous — and this is the byte
+# path into a live terminal, which is the last place to put a bespoke parser. The engine used is
+# `STANDARD`, whose defaults are already the canonical rule the contract's `PtyWriteParams.data`
+# states: padding required and canonical, no trailing-bit slack.
+#
+# `default-features = false` with `std` alone: the crate has no external dependencies, and the
+# omitted default is only `std` itself plus `alloc`. Version and licence verified on crates.io
+# 2026-09-16 — MIT OR Apache-2.0, both on `deny.toml`'s allow list; `rust-version` 1.71.0, under
+# this workspace's 1.96 MSRV.
+base64 = { version = "0.23.1", default-features = false, features = ["std"] }
+# Journal: CRC-32/ISCSI (crc32c) frames and the redb projection store. Verified on crates.io 2026-08-23.
+crc = "3.4.0"
+redb = "4.2.0"
+# Hashing: `HookTokenMinted.token_hash` and `LoopDecided.input_digest` are both blake3 hex, so the
+# supervisor cannot hide it behind a seam. Verified on crates.io 2026-08-23; licence
+# `CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception`, all three on `deny.toml`'s allow list.
+#
+# Type-checking `x86_64-pc-windows-msvc` from a host with no MSVC toolchain: this crate's build
+# script assembles its SIMD sources with `ml64.exe`, which does not exist on macOS, so a
+# `--target x86_64-pc-windows-msvc` check dies there before reaching one line of our code. Prefix
+# the one invocation that needs it, and nothing else:
+#
+#     CARGO_FEATURE_PURE=1 cargo check --all-targets --target x86_64-pc-windows-msvc -p <crate>
+#
+# That variable is the whole of what the crate's `pure` feature does — blake3 1.8.7 derives `pure`
+# from it alone (`build.rs:3-9`) and its Rust sources gate on the cfgs that build script emits,
+# never on `feature = "pure"` — but unlike a feature it never enters the resolved graph, so it
+# cannot unify into an ordinary build or ride a `[target.'cfg(windows)']` edge into a release
+# artefact. It is per-invocation for that reason: exported, it silently moves every hash in that
+# shell to the portable implementation. `cargo xtask blake3-pure [--target <triple>]` is the gate
+# that catches both that and a manifest edge; the reasoning is in `xtask/src/blake3_pure.rs`.
+blake3 = "1.8.7"
+# Peer credentials on a Unix socket. `std::os::unix::net::UnixStream::peer_cred` is unstable on the
+# pinned toolchain (`peer_credentials_unix_socket`, rust-lang/rust#42839), so the `getsockopt` calls
+# live behind a crate that does the `unsafe` internally and exposes a safe `fn` — which is what lets
+# `dudes-rpc` inherit the workspace's `unsafe_code = "forbid"` unchanged. `default-features = false`
+# with only `socket`: the tree is `bitflags, cfg-if, libc, memoffset` and reaches no runtime.
+# MIT; version and licence verified on crates.io 2026-08-26.
+nix = { version = "0.31.3", default-features = false, features = ["socket"] }
+
+# The host's platform layers. Versions and licences verified on crates.io 2026-08-26; all four
+# licences (`MIT`, `Apache-2.0`, `Apache-2.0 WITH LLVM-exception`) are on `deny.toml`'s allow list.
+# Each is named here rather than in the member so the version is declared once, and each is pulled
+# in under a `[target.'cfg(...)']` table by the member so it is only built where it is used.
+# `rustix` without default features: `process` only — nothing here opens a file, a socket or a
+# terminal through it.
+rustix = { version = "1.1.4", default-features = false, features = ["std", "process"] }
+# macOS `proc_pidinfo`. Declares `bindgen` as a build-dependency unconditionally, which is why the
+# member gates it to the one target that uses it rather than taking libclang on every CI leg.
+libproc = "0.14.11"
+# Windows job objects with kill-on-close (invariant 10).
+win32job = "2.0.3"
+# Windows process creation with an explicit inherited-handle list. Exact-pinned because the safe
+# capability surface and Windows 10 version 1809 floor are part of its audited contract.
+windows-spawn = "=0.1.0"
+# Windows FFI, with each member selecting only the API families its responsibility needs. The
+# version lives here; the process host and DACL/filesystem leaf select features for their own
+# responsibilities in target-specific tables. Foundation and System_Threading overlap because
+# both responsibilities use handles, and the leaf reads the current process token.
+windows-sys = "0.61.2"
+# Synchronous byte-mode Windows named pipes for the local control transport. Kept Windows-only by
+# `dudes-rpc`; no runtime or network transport enters the control-plane crate.
+interprocess = { version = "=2.4.4", default-features = false }
+# `SecurityDescriptor::deserialize` consumes a wide SDDL string at bind time. This exact major is
+# shared with interprocess 2.4.3, so the descriptor never crosses two incompatible wide-string
+# types.
+widestring = "=1.2.1"
+
+# Test-only. `jsonschema` without its default features: those pull reqwest and a TLS stack, which
+# dudes-proxy alone may link (invariant 9); the tests only need the in-memory validator.
+jsonschema = { version = "0.58.6", default-features = false }
+# `proptest` without `fork`/`timeout`: the policy and journal properties need neither, and the smaller tree
+# keeps the `cargo deny` surface small.
+proptest = { version = "1.11.0", default-features = false, features = ["std"] }
+regex = "1.13.1"
+tempfile = "3.27.0"
+# The daemon's local calendar day for the Floor's finished-goals shelf, and the local time
+# `dudes tail` prints. `Local` reads the operating system's zone and offset and bundles no timezone
+# database; the daemon takes no zone from configuration. Only the `clock` feature. MIT OR Apache-2.0.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Tests only: a real daylight-saving zone for the 23-hour and 25-hour day controls. The shipped daemon
+# links no timezone database. MIT OR Apache-2.0.
+chrono-tz = { version = "0.10", default-features = false }
+
+# Workspace crates, so members name each other by `workspace = true`.
+dudes-types = { path = "crates/dudes-types", version = "0.79.0", default-features = false }
+dudes-proto = { path = "crates/dudes-proto", version = "0.79.0" }
+dudes-journal = { path = "crates/dudes-journal", version = "0.79.0" }
+dudes-policy = { path = "crates/dudes-policy", version = "0.79.0" }
+dudes-providers = { path = "crates/dudes-providers", version = "0.79.0" }
+dudes-rpc = { path = "crates/dudes-rpc", version = "0.79.0" }
+dudes-supervisor = { path = "crates/dudes-supervisor", version = "0.79.0" }
+dudes-host = { path = "crates/dudes-host", version = "0.79.0" }
+dudes-pty = { path = "crates/dudes-pty", version = "0.79.0" }
+# Windows DACL and filesystem operations. Its source guard checks that the three process/job spellings
+# stay in `dudes-host`; the layering table covers crate dependencies.
+dudes-win = { path = "crates/dudes-win", version = "0.79.0" }
+# The daemon, named here so `bins/dudes` can reach `boot` from its `[dev-dependencies]`. It goes
+# through the shared table rather than a bare `path` for the reason `crates/dudes-rpc`'s own
+# self-reference records: `cargo deny`'s `[bans.workspace-dependencies]` has
+# `include-path-dependencies = true`, so a declaration that bypasses this table is refused once a
+# second member makes one. No `version`: the package is `publish = false`, so there is nothing for a
+# version to mean.
+duded = { path = "bins/duded" }
+
+[workspace.lints.rust]
+# Invariant: `unsafe` is forbidden everywhere. Three crates set `deny` instead — dudes-pty,
+# dudes-host and dudes-win — and a crate that sets `deny` grants `unsafe` to *named modules* with
+# `#[allow(unsafe_code)]`, never crate-wide, and pins the grant with a source scan that fails when
+# it spreads (dudes-host/tests/unsafe_grant.rs is the worked example). `forbid` is what forces that
+# shape: unlike `deny` it cannot be re-levelled from source, so a crate inheriting this table can
+# hold no `unsafe` at all. Override cost: Cargo rejects a [lints] table that both sets
+# `workspace = true` and adds entries, so each of those crates copies this whole table (rust +
+# clippy) into its own Cargo.toml with exactly three deltas — the `unsafe_code` line, plus
+# `unsafe_op_in_unsafe_fn = "deny"` and `clippy::undocumented_unsafe_blocks = "deny"`. Every `unsafe` block has a `// SAFETY:` comment.
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Curated allow list. Add an entry only with a reason.
+module_name_repetitions = "allow" # `journal::JournalWriter` is the house style
+must_use_candidate = "allow"      # too noisy for builder-style APIs
+missing_errors_doc = "allow"      # error variants are documented on the thiserror enum
+missing_panics_doc = "allow"      # panics are bugs, not API
+# Not pedantic, opted in explicitly:
+undocumented_unsafe_blocks = "warn"
+dbg_macro = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+todo = "warn"
+unimplemented = "warn"
+
+[patch.crates-io]
+# Exact reviewed source for macOS execution-identity validation. The vendored crate remains outside
+# the workspace and keeps its own MIT notices; see vendor/libproc/PROVENANCE.md.
+libproc = { path = "vendor/libproc" }

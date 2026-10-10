@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+#
+# The seed below is not reaper evidence and reaches no reaper code: ChildExited is the adapter path, and it shrank out of a mutant on end_turn, which both paths share. Cite it for end_turn; delete it freely once end_turn is covered by a named test.
+cc ab6f6654be6bc2f28e9fd145d66e7ea10df71a8e65fb1ed88d7e7a1df96477c0 # shrinks to ops = [ChildExited(false)]

@@ -1,0 +1,109 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//
+// The page's one stream, and the Floor links pasted into it.
+//
+// `main.tsx` hands these the browser's own socket and location. They live here
+// rather than there so that what they keep can be driven with the stream's own
+// socket factory and clock: only the session the page holds now is handed to
+// the stream, and a link the daemon refused is said, once, without its secret.
+
+import { openFloorStream, reauthenticateFloorStream } from './renderer/floor/stream.ts';
+import type { LocationLike, SocketFactory, StreamTimers } from './renderer/floor/stream.ts';
+import { BuildMismatch, currentFloorSession, floorSessionGeneration } from './session.ts';
+import type { FloorSession } from './session.ts';
+
+/** What the stream is opened with: where the page is, how a socket is made, and its clock. */
+export interface StreamPorts {
+  readonly location: LocationLike;
+  readonly socket: SocketFactory;
+  /** The stream's own clock; the browser's when left out. */
+  readonly timers?: StreamTimers;
+}
+
+/**
+ * Hand a session to the one stream: into the stream already open, or by
+ * opening it. Only the session the page holds now is handed over — a result
+ * that settled after a newer one is stale and moves nothing.
+ */
+export function connect(session: FloorSession, ports: StreamPorts): void {
+  if (session !== currentFloorSession()) return;
+  if (reauthenticateFloorStream(session)) return;
+  openFloorStream(session, ports.location, ports.socket, ports.timers);
+}
+
+/**
+ * The session a refused link was pasted under, by `floorSessionGeneration()`,
+ * or `null`. The line it draws stands only while the page still holds that
+ * session: a newer one taken since, pasted or recovered, has answered it.
+ */
+let refusedUnder: number | null = null;
+let refusedForBuild = false;
+const listeners = new Set<() => void>();
+
+/** Whether the last link pasted into this tab was refused, and nothing newer has signed the page in since. */
+export function pastedLinkRefused(): boolean {
+  return refusedUnder !== null && refusedUnder === floorSessionGeneration();
+}
+
+/** Whether the refusal stands because the daemon now serves a different build from this page's own. */
+export function pastedLinkBuildMismatch(): boolean {
+  return pastedLinkRefused() && refusedForBuild;
+}
+
+export function subscribeToPastedLink(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+  };
+}
+
+/** Whether the daemon refused the link this page was opened with, and no session is held since. */
+let firstRefused = false;
+
+export function firstLinkRefused(): boolean {
+  return firstRefused && currentFloorSession() === null;
+}
+
+/** Say that the daemon refused the link this page was opened with. */
+export function noteFirstLinkRefused(): void {
+  firstRefused = true;
+  for (const listener of [...listeners]) listener();
+}
+
+/** What a reload does: forget the refusal. For tests; the page gets a fresh module per load. */
+export function resetPastedLink(): void {
+  refusedUnder = null;
+  refusedForBuild = false;
+  firstRefused = false;
+  listeners.clear();
+}
+
+/**
+ * Take a Floor link pasted into this open tab: exchange it in place and hand
+ * the session it earns to the stream, so a Hire or an answer this page holds in
+ * memory survives the session it was sent under. A link the daemon refuses, or
+ * one it cannot be reached to exchange, leaves the page as it was, and says so.
+ */
+export async function takePastedLink(
+  exchange: () => Promise<FloorSession | null>,
+  ports: StreamPorts,
+): Promise<void> {
+  const held = floorSessionGeneration();
+  let session: FloorSession | null;
+  try {
+    session = await exchange();
+  } catch (error) {
+    // Said only while the page still holds the session it held when this link
+    // was pasted; a newer one taken meanwhile has already signed it in.
+    if (floorSessionGeneration() === held) {
+      refusedUnder = held;
+      refusedForBuild = error instanceof BuildMismatch;
+      for (const listener of [...listeners]) listener();
+    }
+    return;
+  }
+  if (session === null) return;
+  try {
+    connect(session, ports);
+  } catch {}
+}

@@ -1,0 +1,77 @@
+# Invariant 7, enforced by the compiler rather than by review: within `bins/dudes`, both admitted
+# command types are disallowed. Three items answer the lint with the platform's selected type
+#: `src/quickstart.rs` starts the absolute `duded` path with no arguments,
+# `src/opener.rs` starts the fixed platform opener on a launch file, and `src/login.rs` replaces the
+# CLI with an engine's own login on Unix. The AST gate in `tests/no_interpreter.rs` confines the
+# three items, lists each one's admitted calls and narrows the Windows dependency's capability
+# surface.
+#
+# No allow-listed module, for the reason `bins/duded/clippy.toml` gives: an allow-listed module is a
+# permanent blind spot exactly its own size.
+#
+# **What it does not reach, stated so the gate does not read as covering more than it does.**
+#
+# 1. The standard-library entry bans a *type*, not a *capability*. A crate that spawns internally passes — `xshell::cmd!`, a
+#    `shell_out` helper, `libc::system`, `libc::posix_spawnp` were each planted and each passed this
+#    ban. **There is no layering complement.**
+#    `cargo xtask layering`'s `dudes` row is a denylist of fourteen named crates, not one of them a
+#    spawn crate; and `libc` cannot be added to it, because `dudes` reaches `libc` transitively
+#    through `dudes → dudes-rpc → nix` — measured, and the only route — so such a row would fail
+#    on the shipped graph. What covers those four today is `tests/no_interpreter.rs`'s scan, whose
+#    header states the whole arrangement and its residual. The complete gate would be a `cargo deny`
+#    ban entry.
+# 2. It governs this crate's targets only — `src/` and `tests/` — because clippy resolves one
+#    configuration file per crate by walking up from that crate's manifest.
+# 3. `tests/common/mod.rs` answers it once, with `#[expect]` and a reason: an integration test that
+#    asserts an *exit code* has to run the real binary as a subprocess, and there is no other way to
+#    create a process. `bins/duded/tests/restart.rs` is the precedent and takes the same shape. The
+#    complement that the attribute cannot buy back is `tests/no_interpreter.rs`, whose scan walks
+#    `src/` textually and therefore catches a `process::Command` there whatever attribute sits above
+#    it — and which carries a planted control proving the scan fires.
+# 4. `src/quickstart.rs`, `src/opener.rs` and `src/login.rs` each answer the selected platform type
+#    on one spawn item with `#[expect]`, never with a module allow-list. Deleting one leaves an
+#    unfulfilled expectation; a second item in any of them is refused; and
+#    `tests/no_interpreter.rs` rejects a permanent `#[allow]`, confines both admitted routes to
+#    those three files, parses the cfg-disabled Windows arms, and pins each item's calls.
+#
+# The known cost, which `bins/duded/clippy.toml` and `crates/dudes-policy/clippy.toml` document at
+# the same place: clippy reads exactly one configuration file, so this one replaces the workspace's
+# for this crate and the workspace keys are repeated below; keep them in step with /clippy.toml.
+disallowed-types = [
+    "std::process::Command",
+    "windows_spawn::Command",
+    "windows_spawn::Job",
+    "windows_spawn::ParentProcess",
+    "windows_spawn::SuspendedChild",
+    "windows_spawn::AsPseudoConsole",
+    "windows_spawn::MitigationPolicy",
+]
+
+# Admits only `Command::spawn_with` and the fixed builders used by quickstart and the
+# opener. Resolved method paths keep this effective through imports, aliases, UFCS calls and
+# rustfmt wrapping.
+disallowed-methods = [
+    "windows_spawn::Command::spawn",
+    "windows_spawn::Command::spawn_suspended",
+    "windows_spawn::Command::spawn_suspended_with",
+    "windows_spawn::Command::status",
+    "windows_spawn::Command::status_with",
+    "windows_spawn::Command::output",
+    "windows_spawn::Command::output_with",
+    "windows_spawn::Command::raw_arg",
+    "windows_spawn::Command::arg_handle",
+    "windows_spawn::Command::env_handle",
+    "windows_spawn::Stdio::inherit",
+    "windows_spawn::Stdio::piped",
+    "windows_spawn::Stdio::from_borrowed",
+    "windows_spawn::SpawnOptions::job",
+    "windows_spawn::SpawnOptions::parent_process",
+    "windows_spawn::SpawnOptions::pseudoconsole",
+    "windows_spawn::SpawnOptions::mitigation",
+    "windows_spawn::Child::wait_with_output",
+]
+
+# Workspace keys (see /clippy.toml).
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+avoid-breaking-exported-api = false
