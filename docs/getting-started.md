@@ -52,7 +52,8 @@ Dudes reads no engine's credentials or files.
      and whether it is signed in. The daemon asks the engine's own status command (`claude auth
      status` or `codex login status`) and reads only its exit status. Pi has no such command:
      run `pi`, then type `/login` inside it;
-   - opens the Floor in your browser, as `dudes floor open` does;
+   - prints a one-time link to the Floor, as `dudes floor open` does, for you to paste into any
+     browser;
    - prints the hired agent's id, when you hired one;
    - last, when an engine is signed out, names the others that are and offers to sign in to one.
      A yes runs that engine's own login in your terminal, and `quickstart` ends there.
@@ -61,8 +62,9 @@ Dudes reads no engine's credentials or files.
    The operator file and the `duded.log` line that `quickstart` leaves are described in
    [Configuration](configuration.md#the-operator-file).
 
-3. Use the Floor that opened in your browser. `dudes floor open` opens it again.
-   [The Floor](floor.md) explains how it opens, what each tab shows and what an agent's position
+3. Paste the link into a browser and use the Floor. The link works once, in one browser;
+   `dudes floor open` prints a new one. On a remote machine, forward the link's port over SSH first, because
+   the link is a loopback address. [The Floor](floor.md) explains how it signs in, what each tab shows and what an agent's position
    in the office means.
 
 4. Hire more agents. On the Floor, click **Hire an agent**, choose the workspace and an engine it
@@ -125,7 +127,7 @@ followed by `dudes quickstart --restart`.
 
 Without a terminal and without options, `dudes quickstart` only starts the daemon and prints its
 version and control socket, as scripts expect. With options it asks nothing,
-opens no browser and prints no live Floor link: it prints `dudes floor open`, and `dudes login
+prints no live Floor link: it prints `dudes floor open`, and `dudes login
 <engine>` for each engine that is signed out. `--yes` takes every default, `--set <key> <value>`
 sets what `dudes config set` sets, `--enroll` enrolls the current repository and `--hire <name>`
 hires a first agent there, with the completion check after `--`; a setting that breaks one of the
