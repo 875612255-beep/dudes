@@ -40,7 +40,7 @@ const BASELINE_LINES: Readonly<Record<Baseline | 'absent', string>> = Object.fre
 
 export function AgentDetail({
   row, selection = null, streamState = null, control = null, retire = null, terminal = null, enable = null, answer = null, goal: goalForm = null,
-  messages = null, chat = null, terminalDetails = null, liveOutput = null, git = null, memory = null, tab = 'overview', onTabChange = () => {}, live = false,
+  messages = null, chat = null, liveOutput = null, git = null, memory = null, tab = 'overview', onTabChange = () => {}, live = false,
 }: {
   readonly row: AgentRow;
   readonly selection?: ReactNode;
@@ -57,7 +57,6 @@ export function AgentDetail({
   readonly chat?: ReactNode;
   /** Overview's collapsed live output, for an agent that has some. */
   readonly liveOutput?: ReactNode;
-  readonly terminalDetails?: ReactNode;
   readonly git?: ReactNode;
   readonly memory?: ReactNode;
   readonly tab?: DetailTab;
@@ -108,7 +107,6 @@ export function AgentDetail({
       {liveOutput}
     </> },
     { id: 'chat', label: 'Chat', content: chat },
-    { id: 'terminal', label: 'Terminal', content: terminalDetails },
     { id: 'git', label: 'Git', content: git },
     { id: 'memory', label: 'Memory', content: memory },
     { id: 'messages', label: 'Messages', content: messages },
