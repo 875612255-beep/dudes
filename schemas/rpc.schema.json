@@ -1529,6 +1529,42 @@
         }
       ]
     },
+    "CardTicket": {
+      "description": "What the floor snapshot says of a ticket. It carries no note, message, summary, path, argv,\ncheck name or check output: those come only from `ticket.read`. It is small on purpose, because\nthe snapshot's card budget has to hold the most tickets the board allows.",
+      "properties": {
+        "position": {
+          "description": "Its place in its holder's queue, counting from 1, while it waits there.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TicketReason"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why the daemon moved the ticket into Needs you, while it is there."
+        },
+        "round": {
+          "description": "How many times work on the ticket has started; absent before the first start.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "stopping": {
+          "description": "The ticket was stopped and its agent is still finishing its current step.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "CardTransitionParams": {
       "additionalProperties": false,
       "description": "`board.transition` params.",
@@ -1605,6 +1641,17 @@
         "status_by": {
           "$ref": "#/$defs/Actor",
           "description": "Who authored [`Self::status`]. The board fold takes it from whichever record last moved\nthe card, so the three records that can put a card into a status collapse into one field\na reader compares once. Not [`Self::claimed_by`], which is who *holds* the card.\nWhat a `BoardState` predicate does with it is decided where that predicate is evaluated, not restated\nhere."
+        },
+        "ticket": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CardTicket"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What the board shows of a ticket beyond what every card has. Absent on a plain card. An\nolder reader ignores it."
         },
         "title": {
           "description": "Title.",
@@ -6297,6 +6344,13 @@
           "description": "Agents retired since the previous delta.",
           "items": {
             "$ref": "#/$defs/AgentId"
+          },
+          "type": "array"
+        },
+        "removed_cards": {
+          "description": "Cards removed from the board since the previous delta. An older reader ignores it.",
+          "items": {
+            "$ref": "#/$defs/CardId"
           },
           "type": "array"
         },
