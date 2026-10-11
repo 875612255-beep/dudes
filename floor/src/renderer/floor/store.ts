@@ -261,6 +261,11 @@ export interface FloorState {
    */
   readonly git: boolean;
   /**
+   * Whether the latest snapshot carried the `ticket` sibling: the operator turned the board's
+   * actions on. Without it the page draws no ticket form and no ticket action.
+   */
+  readonly ticket: boolean;
+  /**
    * The daemon's provider check and home from the latest snapshot, or `null`
    * when that snapshot carried none — the check did not answer in time — or
    * carried something unreadable. Display metadata, never authority, and never
@@ -305,6 +310,7 @@ const EMPTY: FloorState = Object.freeze({
   terminal: false,
   retire: false,
   git: false,
+  ticket: false,
   daemon: null,
   settings: null,
   journalStopped: null,
@@ -358,6 +364,7 @@ export function noteTransport(event: 'open' | 'close'): void {
     terminal: event === 'close' ? false : state.terminal,
     retire: event === 'close' ? false : state.retire,
     git: event === 'close' ? false : state.git,
+    ticket: event === 'close' ? false : state.ticket,
     daemon: event === 'close' ? null : state.daemon,
     settings: event === 'close' ? null : state.settings,
     journalStopped: event === 'close' ? null : state.journalStopped,
@@ -453,6 +460,7 @@ export function invalidateFloorEpoch(): void {
     terminal: false,
     retire: false,
     git: false,
+    ticket: false,
     daemon: null,
     settings: null,
     journalStopped: null,
@@ -501,7 +509,7 @@ export function applyServerFrame(
         retiredAgents: Object.freeze([]),
         messages: Object.freeze([]),
         threads: Object.freeze([]), messagesLsn: null, onboarding: null, checks: null, answering: null, control: false,
-        goalChange: null, terminal: false, retire: false, git: false, daemon: null, settings: null, journalStopped: null,
+        goalChange: null, terminal: false, retire: false, git: false, ticket: false, daemon: null, settings: null, journalStopped: null,
         finishedToday: FINISHED_TODAY_UNAVAILABLE, closingTime: null });
       return;
     case 'floor.heartbeat':
@@ -535,6 +543,7 @@ interface ServerMessage {
   readonly terminal?: unknown;
   readonly retire?: unknown;
   readonly git?: unknown;
+  readonly ticket?: unknown;
   readonly daemon?: unknown;
   readonly settings?: unknown;
   readonly journal_stopped?: unknown;
@@ -780,6 +789,7 @@ function fromSnapshot(message: ServerMessage): FloorState {
     terminal: decodeSwitchSibling(message.terminal),
     retire: decodeSwitchSibling(message.retire),
     git: decodeSwitchSibling(message.git),
+    ticket: decodeSwitchSibling(message.ticket),
     goalChange: decodeGoalLimits(message.goal),
     daemon: decodeDaemonReport(message.daemon),
     settings: decodeSettingsReport(message.settings),
@@ -846,6 +856,9 @@ function fromDelta(delta: Record<string, unknown>, message: ServerMessage): Floo
     ? { rows: state.retiredAgents, rejected: 0 } : decodeRetiredAgents(delta.retired_agents);
   const nextCards = new Map(state.cards.map((card) => [card.id, card]));
   for (const card of cardChanges.rows) nextCards.set(card.id, card);
+  for (const id of Array.isArray(delta.removed_cards) ? delta.removed_cards : []) {
+    if (typeof id === 'string') nextCards.delete(id);
+  }
   const removed = new Set(
     (Array.isArray(delta.removed_agents) ? delta.removed_agents : [])
       .filter((id): id is string => typeof id === 'string' && AGENT_ID.test(id)),
@@ -875,7 +888,7 @@ function fromDelta(delta: Record<string, unknown>, message: ServerMessage): Floo
     messages: messages.rows,
     threads: messages.threads,
     messagesLsn: messages.cut,
-    doneNotices: announce(agents),
+    doneNotices: announce(agents, [...nextCards.values()]),
     output: state.output.targetId !== null && !next.has(state.output.targetId)
       ? emptyOutput(state.output, 'unavailable') : state.output,
     rejected: state.rejected + sifted.rejected + cardChanges.rejected + activity.rejected + retired.rejected + messages.rejected
@@ -883,9 +896,9 @@ function fromDelta(delta: Record<string, unknown>, message: ServerMessage): Floo
   };
 }
 
-function announce(agents: readonly AgentRow[]): readonly DoneNotice[] {
+function announce(agents: readonly AgentRow[], cards: readonly CardRow[]): readonly DoneNotice[] {
   const snapshotArrived = state.snapshotEpoch === state.epoch;
-  const fresh = snapshotArrived ? newlyDone(state.agents, agents) : [];
+  const fresh = snapshotArrived ? newlyDone(state.agents, agents, cards) : [];
   return fresh.length === 0 ? state.doneNotices : Object.freeze([...state.doneNotices, ...fresh]);
 }
 
@@ -917,6 +930,7 @@ function unchanged(current: FloorState, next: FloorState): boolean {
     && current.terminal === next.terminal
     && current.retire === next.retire
     && current.git === next.git
+    && current.ticket === next.ticket
     && current.daemon === next.daemon
     && current.settings === next.settings
     && current.journalStopped === next.journalStopped
