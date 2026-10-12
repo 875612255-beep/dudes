@@ -500,9 +500,15 @@ fn help_lists_the_ticket_commands_with_one_worked_example() {
         "ticket remove <card>",
         "ticket list [--status",
         "ticket show <card>",
+        "ticket open <card> [--editor <absolute-program> | --print]",
     ] {
         assert!(run.stdout.contains(command), "{command}");
     }
+    assert!(run.stdout.contains("--json never launches an editor"));
+    assert!(
+        run.stdout
+            .contains("Lease verification requires macOS or Linux")
+    );
     assert_eq!(run.stdout.matches("EXAMPLE: tickets").count(), 1);
     for command in [
         "ticket accept <card>",
@@ -717,5 +723,126 @@ fn changes_needs_a_message_and_the_review_commands_take_a_card() {
         run.stderr.contains("unknown option `--message`"),
         "{}",
         run.stderr
+    );
+}
+
+#[test]
+fn opening_a_ticket_cannot_print_and_launch_an_editor() {
+    let run = Cli::bare()
+        .args([
+            "ticket",
+            "open",
+            "00000000000000000000000004",
+            "--print",
+            "--editor",
+            "/usr/bin/true",
+        ])
+        .run();
+
+    assert_eq!(run.code(), 1, "{}", run.output());
+    assert_eq!(run.stdout, "");
+    assert_eq!(
+        run.stderr,
+        "dudes: `--print` cannot be combined with `--editor`\n\
+         Run `dudes --help` for every command and its options.\n"
+    );
+}
+
+#[test]
+fn opening_an_assigned_ticket_prints_its_recorded_directory() {
+    let world = world();
+    let agent = world.hire("Cody", &world.repo);
+    let card = world.add("Review the recorded checkout");
+    let given = world.dudes(["ticket", "give", &card, "--agent", &agent]);
+    assert_eq!(given.code(), 0, "{}", given.output());
+
+    let opened = world.dudes(["ticket", "open", &card, "--print"]);
+    assert_eq!(opened.code(), 0, "{}", opened.output());
+    assert_eq!(opened.stdout, format!("{}\n", world.repo.display()));
+    assert_eq!(opened.stderr, "");
+}
+
+#[test]
+fn machine_checkout_output_cannot_be_combined_with_an_explicit_editor() {
+    const CARD: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    for args in [
+        vec![
+            "--json",
+            "ticket",
+            "open",
+            CARD,
+            "--editor",
+            "/usr/bin/true",
+        ],
+        vec![
+            "ticket",
+            "open",
+            CARD,
+            "--editor",
+            "/usr/bin/true",
+            "--json",
+        ],
+    ] {
+        let run = Cli::bare().args(args).run();
+        assert_eq!(run.code(), 1, "{}", run.output());
+        assert_eq!(run.stdout, "");
+        assert_eq!(
+            run.stderr,
+            "dudes: `--json` cannot be combined with `--editor`\nRun `dudes --help` for every command and its options.\n"
+        );
+    }
+}
+
+#[test]
+fn opening_without_editor_configuration_prints_the_explicit_launch_form() {
+    let world = world();
+    let agent = world.hire("Cody", &world.repo);
+    let card = world.add("Review locally");
+    assert_eq!(
+        world
+            .dudes(["ticket", "give", &card, "--agent", &agent])
+            .code(),
+        0
+    );
+
+    let opened = world.dudes(["ticket", "open", &card]);
+    assert_eq!(opened.code(), 0, "{}", opened.output());
+    assert_eq!(
+        opened.stdout,
+        format!(
+            "{}\nTo open an editor, run `dudes ticket open {card} --editor /absolute/program`.\n",
+            world.repo.display()
+        )
+    );
+    assert_eq!(opened.stderr, "");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn checkout_reads_survive_a_stopped_writer_while_ticket_changes_stay_fenced() {
+    let world = world();
+    let agent = world.hire("Cody", &world.repo);
+    let card = world.add("Review after a write failure");
+    assert_eq!(
+        world
+            .dudes(["ticket", "give", &card, "--agent", &agent])
+            .code(),
+        0
+    );
+    world.running.append_failure.short_write_next(5);
+    let failed = world.dudes(["--json", "ticket", "add", "--title", "Fail this append"]);
+    assert_eq!(failed.json_error().code, -32603, "{}", failed.output());
+    let before = world.dudes(["--json", "ping"]).json::<serde_json::Value>()["lsn"].clone();
+    let shown = world.dudes(["ticket", "show", &card]);
+    assert_eq!(shown.code(), 0, "{}", shown.output());
+
+    let opened = world.dudes(["ticket", "open", &card, "--print"]);
+    assert_eq!(opened.code(), 0, "{}", opened.output());
+    assert_eq!(opened.stdout, format!("{}\n", world.repo.display()));
+    let changed = world.dudes(["--json", "ticket", "add", "--title", "Still fenced"]);
+    assert_eq!(changed.json_error().code, -32006, "{}", changed.output());
+    assert_eq!(
+        world.dudes(["--json", "ping"]).json::<serde_json::Value>()["lsn"],
+        before
     );
 }

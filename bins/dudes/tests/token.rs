@@ -30,14 +30,6 @@
 //! There is also a **structural** defence: `render_answer` does not take the [`Environment`] at all, so no renderer can reach the
 //! token without a signature change. The only place a leak could be written is `dispatch`.
 //!
-//! # Argv, stated honestly
-//!
-//! Quickstart creates the daemon from an absolute path, adds no arguments beyond the executable,
-//! and composes an environment that excludes `DUDES_TOKEN`; `no_interpreter.rs` confines that one
-//! process route. So "the token appears in no argv element" remains true by construction rather
-//! than inspection, and a test that "checked" an argv here would be checking a list it had built
-//! itself. What *is* checkable — and is checked below — is that the token reaches neither output
-//! stream, on every path this binary has.
 #![cfg(unix)]
 
 use std::collections::BTreeMap;

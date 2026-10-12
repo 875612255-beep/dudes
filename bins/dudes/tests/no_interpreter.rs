@@ -1,11 +1,10 @@
 //! Invariant 7's other half: the CLI names no interpreter route and composes no shell string, and
 //! the scan that says so fires.
 //!
-//! The CLI starts exactly two programs, each from one audited site: quickstart's
-//! daemon in `src/quickstart.rs` and an engine's own login in `src/login.rs`. The programs it
-//! starts may themselves be scripts, as a `#!/usr/bin/env node` vendor CLI is; what they do inside is the platform's or the vendor's.
-//! What this file holds is what Dudes composes: typed argv, an absolute program, no shell string
-//! and no `PATH` search.
+//! The CLI's three process items start quickstart's daemon, an engine's login, or the
+//! operator's selected editor. Those programs may themselves be scripts. This file confines
+//! what Dudes composes: typed argv, an absolute program, and no shell string. Only the editor
+//! resolves a launch program on the operator's `PATH`.
 //!
 //! # Why a scan when `clippy.toml` already bans the type
 //!
@@ -111,7 +110,7 @@ const QUOTED_ROUTES: &[&str] = &["\"sh\"", "\"bash\"", "\"/bin/sh\"", "\"-c\""];
 const MIN_FILES: usize = 6;
 
 /// The files that may name a command type, each with one spawn item.
-const ROUTE_FILES: [&str; 2] = ["quickstart.rs", "login.rs"];
+const ROUTE_FILES: [&str; 3] = ["quickstart.rs", "login.rs", "editor.rs"];
 
 /// The lints whose `allow` or `expect` silences the command-type ban: the two lints it is made of,
 /// the clippy groups that hold them, and every warning at once.
@@ -124,11 +123,12 @@ const BAN_LINTS: [&str; 5] = [
 ];
 
 /// The files of this package that may carry one `#[expect(clippy::disallowed_types)]`, and nothing
-/// else from [`BAN_LINTS`]: the two route items, and the two test helpers that start a real
+/// else from [`BAN_LINTS`]: the three route items, and the two test helpers that start a real
 /// process (`bins/dudes/clippy.toml` item 3).
-const ADMITTED_EXPECTATIONS: [&str; 4] = [
+const ADMITTED_EXPECTATIONS: [&str; 5] = [
     "src/quickstart.rs",
     "src/login.rs",
+    "src/editor.rs",
     "tests/common/mod.rs",
     "tests/windows_pipe_owner.rs",
 ];
@@ -374,6 +374,7 @@ fn route_violations(package: &Path) -> Vec<String> {
     for (file, routes) in [
         ("quickstart.rs", &COMMAND_ROUTES[..]),
         ("login.rs", &COMMAND_ROUTES[..1]),
+        ("editor.rs", &COMMAND_ROUTES[..1]),
     ] {
         for route in routes {
             if !found
@@ -2394,6 +2395,7 @@ fn spawn() -> Result<(), Error> {
 // admitted, in call position.
 mod route_items {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::io::Write as _;
     use std::path::Path;
 
     use syn::visit::{self, Visit};
@@ -2650,6 +2652,21 @@ mod route_items {
             "current_dir(home)",
             "current_dir(managed.plan.cwd)",
             "env(\"CODEX_HOME\",managed.home)",
+            "env_remove(\"DUDES_SOCK\")",
+            "env_remove(\"DUDES_TOKEN\")",
+            "exec()",
+        ],
+        terminal: "exec",
+        after: &[],
+    };
+
+    const EDITOR: Profile = Profile {
+        label: "editor",
+        constructor: "std::process::Command::new",
+        program: "program",
+        calls: &[
+            "arg(directory)",
+            "args(args)",
             "env_remove(\"DUDES_SOCK\")",
             "env_remove(\"DUDES_TOKEN\")",
             "exec()",
@@ -2977,6 +2994,131 @@ mod route_items {
         violations.into_iter().collect()
     }
 
+    fn editor(text: &str) -> Vec<String> {
+        let file = syn::parse_file(text).expect("the editor parses");
+        let mut violations = BTreeSet::new();
+        let item = match spawn_item(&file) {
+            Ok(item) => item,
+            Err(violation) => return vec![violation],
+        };
+        if item.sig.ident != "exec"
+            || !item.attrs.iter().any(|attribute| {
+                attribute.path().is_ident("cfg")
+                    && attribute
+                        .meta
+                        .require_list()
+                        .is_ok_and(|list| list.tokens.to_string() == "unix")
+            })
+            || super::ban_suppressions(text) != ["expect(clippy::disallowed_types)"]
+        {
+            violations.insert("editor grant: not the single Unix exec item".to_owned());
+        }
+        rest_of_file("editor", &file, item, LOGIN_FILE_PATHS, &mut violations);
+        let mut facts = Facts::default();
+        facts.visit_item_fn(item);
+        census("editor", &facts, LOGIN_PATHS, &mut violations);
+        let chains = chains(&facts);
+        let admitted = command(&EDITOR, &facts, &chains, &mut violations);
+        strays("editor", &facts, &admitted, &mut violations);
+        if ["program", "args", "directory"]
+            .iter()
+            .any(|name| facts.locals.contains_key(*name))
+        {
+            violations.insert("editor operands: rebound inside exec".to_owned());
+        }
+        let forms: Vec<_> = item
+            .block
+            .stmts
+            .iter()
+            .map(|statement| match statement {
+                Stmt::Local(local)
+                    if local
+                        .init
+                        .as_ref()
+                        .is_some_and(|init| calls(&init.expr, EDITOR.constructor)) =>
+                {
+                    "new(program)".to_owned()
+                }
+                Stmt::Expr(Expr::MethodCall(call), _)
+                    if ident(&call.receiver).as_deref() == Some("command") =>
+                {
+                    call_text(call)
+                }
+                _ => "?".to_owned(),
+            })
+            .collect();
+        if forms
+            != [
+                "new(program)",
+                "args(args)",
+                "arg(directory)",
+                "env_remove(\"DUDES_TOKEN\")",
+                "env_remove(\"DUDES_SOCK\")",
+                "exec()",
+            ]
+            || !matches!(item.block.stmts.last(), Some(Stmt::Expr(Expr::MethodCall(call), None)) if call.method == "exec")
+        {
+            violations.insert("editor body: not the admitted ordered handoff".to_owned());
+        }
+        violations.into_iter().collect()
+    }
+
+    fn path_lookups(name: &str, text: &str) -> Vec<String> {
+        struct Lookups<'a> {
+            file: &'a str,
+            function: String,
+            violations: Vec<String>,
+        }
+        impl<'ast> Visit<'ast> for Lookups<'_> {
+            fn visit_item_fn(&mut self, function: &'ast ItemFn) {
+                let previous =
+                    std::mem::replace(&mut self.function, function.sig.ident.to_string());
+                visit::visit_item_fn(self, function);
+                self.function = previous;
+            }
+            fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+                if let Expr::Path(path) = call.func.as_ref() {
+                    let name = path.path.segments.last().unwrap().ident.to_string();
+                    let reads_path = matches!(name.as_str(), "var" | "var_os")
+                        && call
+                            .args
+                            .first()
+                            .is_some_and(|argument| render(argument) == "\"PATH\"");
+                    if (name == "split_paths" || reads_path)
+                        && !matches!(
+                            (self.file, self.function.as_str()),
+                            ("editor.rs", "resolve_configured_program") | ("setup.rs", "on_path")
+                        )
+                    {
+                        self.violations
+                            .push(format!("{}::{}: {name}", self.file, self.function));
+                    }
+                }
+                visit::visit_expr_call(self, call);
+            }
+            fn visit_use_tree(&mut self, tree: &'ast UseTree) {
+                let name = match tree {
+                    UseTree::Name(name) => Some(&name.ident),
+                    UseTree::Rename(name) => Some(&name.ident),
+                    _ => None,
+                };
+                if name.is_some_and(|name| name == "split_paths") {
+                    self.violations
+                        .push(format!("{}: split_paths import", self.file));
+                }
+                visit::visit_use_tree(self, tree);
+            }
+        }
+        let file = syn::parse_file(text).expect("the lookup source parses");
+        let mut found = Lookups {
+            file: name,
+            function: String::new(),
+            violations: Vec::new(),
+        };
+        found.visit_file(&file);
+        found.violations
+    }
+
     fn managed_login_branch(statements: &[Stmt]) -> bool {
         let forms = |body: &syn::Block| {
             body.stmts
@@ -3025,6 +3167,91 @@ mod route_items {
     #[test]
     fn the_login_makes_only_its_admitted_calls() {
         assert_eq!(login(&source("login.rs")), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_editor_makes_only_its_admitted_calls() {
+        assert_eq!(editor(&source("editor.rs")), Vec::<String>::new());
+    }
+
+    #[test]
+    fn editor_item_mutants_are_rejected_without_widening_the_grant() {
+        assert!(editor(&source("editor.rs")).is_empty());
+        for (name, from, to) in [
+            (
+                "extra spawn",
+                "    command.exec()",
+                "    command.spawn();\n    command.exec()",
+            ),
+            (
+                "composed interpreter",
+                "Command::new(program)",
+                "Command::new(\"/bin/sh\")",
+            ),
+            (
+                "extra operand",
+                "    command.arg(directory);",
+                "    command.arg(directory);\n    command.arg(\"extra\");",
+            ),
+            (
+                "credential retained",
+                "    command.env_remove(\"DUDES_TOKEN\");\n",
+                "",
+            ),
+            (
+                "exec reordered",
+                "    command.env_remove(\"DUDES_SOCK\");\n    command.exec()",
+                "    command.exec();\n    command.env_remove(\"DUDES_SOCK\");",
+            ),
+            (
+                "broad allowance",
+                "clippy::disallowed_types,",
+                "clippy::all,",
+            ),
+        ] {
+            let found = editor(&mutant("editor.rs", from, to));
+            assert!(!found.is_empty(), "surviving {name}");
+            writeln!(std::io::stdout().lock(), "{name}: {found:?}").unwrap();
+        }
+        let another = format!(
+            "{}\nfn another(program: &Path) {{ std::process::Command::new(program).spawn(); }}\n",
+            source("editor.rs")
+        );
+        assert!(!editor(&another).is_empty());
+    }
+
+    #[test]
+    fn path_lookup_stays_in_the_editor_resolver_and_existing_setup_probe() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        super::walk(&root, &mut |path| {
+            if path.extension().is_some_and(|extension| extension == "rs") {
+                let source = std::fs::read_to_string(path).unwrap();
+                assert!(
+                    path_lookups(path.file_name().unwrap().to_str().unwrap(), &source).is_empty(),
+                    "{}",
+                    path.display()
+                );
+            }
+        });
+        for name in ["editor.rs", "run.rs"] {
+            let mutant = format!(
+                "{}\nfn another_lookup() {{ let path = std::env::var_os(\"PATH\").unwrap(); let _ = std::env::split_paths(&path); }}\n",
+                source(name)
+            );
+            let rejected = path_lookups(name, &mutant);
+            assert_eq!(rejected.len(), 2, "{name}: {rejected:?}");
+            writeln!(
+                std::io::stdout().lock(),
+                "PATH lookup outside resolver in {name}: {rejected:?}"
+            )
+            .unwrap();
+        }
+        let aliased =
+            "use std::env::split_paths as elsewhere; fn another() { let _ = elsewhere(\"x\"); }";
+        assert_eq!(
+            path_lookups("run.rs", aliased),
+            ["run.rs: split_paths import"]
+        );
     }
 
     #[test]

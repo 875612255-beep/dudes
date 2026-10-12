@@ -47,16 +47,20 @@ fn insert_rpc_definition<T: JsonSchema>(doc: &mut Exported, name: &str) {
         .insert(name.to_owned(), schema);
 }
 
-fn insert_floor_views(doc: &mut Exported) {
+fn insert_rpc_extensions(doc: &mut Exported) {
+    insert_rpc_definition::<crate::rpc::CurrentMethods>(doc, "CurrentMethods");
+    doc.schema["properties"]["methods"] = serde_json::json!({
+        "$ref": "#/$defs/CurrentMethods",
+    });
+    insert_rpc_definition::<crate::rpc::team::RosterAgentParams>(doc, "RosterAgentParams");
+    insert_rpc_definition::<crate::rpc::closing::ClosingSchema>(doc, "ClosingSchema");
     insert_rpc_definition::<crate::projection::FloorProjectionView<'_>>(doc, "FloorProjectionView");
     insert_rpc_definition::<crate::projection::FloorDeltaView<'_>>(doc, "FloorDeltaView");
 }
 
 fn export_rpc() -> Exported {
     let mut doc = export::<Rpc>("rpc.schema.json");
-    insert_rpc_definition::<crate::rpc::team::RosterAgentParams>(&mut doc, "RosterAgentParams");
-    insert_rpc_definition::<crate::rpc::closing::ClosingSchema>(&mut doc, "ClosingSchema");
-    insert_floor_views(&mut doc);
+    insert_rpc_extensions(&mut doc);
     let mut doctor = schema_for::<crate::rpc::system::DoctorJournalResult>().to_value();
     let definitions = doctor.as_object_mut().unwrap().remove("$defs").unwrap();
     let defs = doc.schema["$defs"].as_object_mut().unwrap();
@@ -1329,10 +1333,8 @@ mod tests {
         );
     }
 
-    /// The RPC document carries every method and notification by wire name, so a generated
-    /// client cannot miss one.
     #[test]
-    fn rpc_schema_lists_every_method_and_notification() {
+    fn legacy_rpc_schema_lists_every_method_and_notification() {
         let rpc = schema_for::<Rpc>().to_value();
         let methods = &rpc["$defs"]["Methods"]["properties"];
         for method in crate::rpc::Method::ALL {
@@ -1341,6 +1343,53 @@ mod tests {
         let notifications = &rpc["$defs"]["Notifications"]["properties"];
         for kind in crate::rpc::NotificationKind::ALL {
             assert!(notifications.get(kind.name()).is_some(), "{kind} missing");
+        }
+    }
+
+    #[test]
+    fn the_generated_and_committed_current_method_catalogs_agree() {
+        use crate::rpc::{CurrentMethod, Method};
+        use std::collections::BTreeSet;
+
+        let generated = schemas()
+            .into_iter()
+            .find(|document| document.file_name == "rpc.schema.json")
+            .unwrap()
+            .schema;
+        let committed = exported_file("rpc.schema.json");
+        let legacy: BTreeSet<_> = Method::ALL.iter().map(|method| method.name()).collect();
+        let current: BTreeSet<_> = legacy
+            .iter()
+            .copied()
+            .chain([CurrentMethod::TicketCheckout.name()])
+            .collect();
+        for schema in [&generated, &committed] {
+            assert_eq!(
+                schema["properties"]["methods"]["$ref"],
+                "#/$defs/CurrentMethods"
+            );
+            for (definition, expected) in [("Methods", &legacy), ("CurrentMethods", &current)] {
+                let actual: BTreeSet<_> = schema["$defs"][definition]["properties"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect();
+                assert_eq!(&actual, expected);
+            }
+            let checkout = &schema["$defs"]["CurrentMethods"]["properties"]["ticket.checkout"];
+            assert_eq!(
+                checkout["properties"]["params"]["$ref"],
+                "#/$defs/TicketCheckoutParams"
+            );
+            assert_eq!(
+                checkout["properties"]["result"]["$ref"],
+                "#/$defs/TicketCheckoutResult"
+            );
+            assert_eq!(
+                schema["$defs"]["TicketCheckoutParams"]["additionalProperties"],
+                false
+            );
         }
     }
 

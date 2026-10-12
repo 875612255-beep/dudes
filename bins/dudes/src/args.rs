@@ -281,6 +281,13 @@ impl From<String> for AgentRef {
 /// One operator ticket command.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TicketCommand {
+    /// Review the ticket's recorded checkout locally.
+    Open {
+        /// The ticket.
+        card: CardId,
+        /// The operator's local review choice.
+        selection: EditorSelection,
+    },
     /// Create a ticket, and give it to an agent when `give_to` is set.
     Add {
         /// The ticket's fields.
@@ -354,6 +361,17 @@ pub enum TicketCommand {
         /// The ticket.
         card: CardId,
     },
+}
+
+/// How the operator wants the recorded directory handed off.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EditorSelection {
+    /// Print without consulting editor configuration.
+    Print,
+    /// Use operator configuration, or print the explicit launch form when it is absent.
+    Configured,
+    /// Use this absolute operator-selected executable without environment arguments.
+    Explicit(PathBuf),
 }
 
 /// One `worktree` subcommand.
@@ -728,6 +746,18 @@ COMMANDS
             dudes ticket changes <card> --message \"Also cover the empty form.\"
             dudes ticket stop <card>
 
+    ticket open <card> [--editor <absolute-program> | --print]
+        Review the current agent's recorded directory without changing the ticket.
+        --editor selects one absolute executable, with the directory as its only argument.
+        Otherwise use the first nonblank VISUAL, then EDITOR, on the operator's PATH.
+        Environment arguments split on whitespace; quotes and shell characters stay literal.
+        Use --editor for a program path containing spaces, or a wrapper for grouped arguments.
+        Invalid selected editors are refused without falling back to another selection.
+        --print only prints; --json never launches an editor. Both bypass editor configuration.
+        Neither can be combined with --editor. Without configuration, print the directory
+        and the explicit launch command. Windows and SSH sessions only print the directory.
+        Lease verification requires macOS or Linux; other platforms refuse leased checkouts.
+
     workspace add [<path>] [--id <id>] [--completion-check-label <text>] [--department <dept>]
                   [--hop-cap <n>] [--timeout-s <n>] [--label <text>]
                   [--agent-usd-per-day <usd>] [--goal-usd <usd>]
@@ -962,7 +992,7 @@ fn parse_global(argv: &[OsString]) -> Result<Invocation, ArgError> {
         "workspace" => Command::Workspace(workspace(tail, payload)?),
         "worktree" => Command::Worktree(worktree(tail)?),
         "board" => Command::Board(board(tail)?),
-        "ticket" => Command::Ticket(ticket(tail)?),
+        "ticket" => Command::Ticket(ticket(tail, json)?),
         "config" if json => return Err(ArgError::TextOnly("config")),
         "config" => Command::Config(config_command(tail)?),
         other => return Err(ArgError::UnknownCommand(other.to_owned())),
@@ -1409,7 +1439,7 @@ fn board(tail: &[OsString]) -> Result<BoardCommand, ArgError> {
     clippy::too_many_lines,
     reason = "one parser reads every ticket subcommand's flags, and each subcommand adds its arm"
 )]
-fn ticket(tail: &[OsString]) -> Result<TicketCommand, ArgError> {
+fn ticket(tail: &[OsString], json: bool) -> Result<TicketCommand, ArgError> {
     let Some((command, rest)) = tail.split_first() else {
         return Err(ArgError::NoSubcommand("ticket"));
     };
@@ -1419,18 +1449,29 @@ fn ticket(tail: &[OsString]) -> Result<TicketCommand, ArgError> {
     let subcommand = command.to_string_lossy();
     if !matches!(
         subcommand.as_ref(),
-        "add" | "edit" | "give" | "changes" | "accept" | "stop" | "remove" | "list" | "show"
+        "add"
+            | "edit"
+            | "give"
+            | "changes"
+            | "accept"
+            | "stop"
+            | "remove"
+            | "list"
+            | "show"
+            | "open"
     ) {
         return Err(ArgError::UnknownCommand(format!("ticket {subcommand}")));
     }
     let takes_card = matches!(
         subcommand.as_ref(),
-        "edit" | "give" | "changes" | "accept" | "stop" | "remove" | "show"
+        "edit" | "give" | "changes" | "accept" | "stop" | "remove" | "show" | "open"
     );
     let mut flags = Flags::new(rest);
     let mut card = None;
     let (mut title, mut note, mut project, mut done_when) = (None, None, None, None);
     let (mut agent, mut message, mut status, mut seq) = (None, None, None, None);
+    let mut print = false;
+    let mut editor = None;
     while let Some(arg) = flags.next() {
         match (subcommand.as_ref(), arg.to_string_lossy().as_ref()) {
             (_, "--help" | "-h") => return Err(ArgError::HelpRequested),
@@ -1445,6 +1486,8 @@ fn ticket(tail: &[OsString]) -> Result<TicketCommand, ArgError> {
                 seq = Some(Seq(flags.parsed::<u64>("--expected-seq", "a whole number")?));
             }
             ("list", "--status") => status = Some(ticket_status(&mut flags)?),
+            ("open", "--print") => print = true,
+            ("open", "--editor") => editor = Some(flags.path("--editor")?),
             (_, other) if takes_card && card.is_none() && !other.starts_with('-') => {
                 card = Some(
                     arg.to_str()
@@ -1463,6 +1506,36 @@ fn ticket(tail: &[OsString]) -> Result<TicketCommand, ArgError> {
     if takes_card {
         let card = required(card, "<card>")?;
         return match subcommand.as_ref() {
+            "open" => {
+                if print && editor.is_some() {
+                    return Err(ArgError::Conflicting("--print", "--editor"));
+                }
+                if let Some(program) = &editor
+                    && !program.is_absolute()
+                {
+                    return Err(ArgError::BadValue {
+                        flag: "--editor",
+                        value: program.to_string_lossy().into_owned(),
+                        what: "an absolute program path",
+                    });
+                }
+                if json && editor.is_some() {
+                    return Err(ArgError::Conflicting("--json", "--editor"));
+                }
+                Ok(TicketCommand::Open {
+                    card,
+                    selection: editor.map_or_else(
+                        || {
+                            if print {
+                                EditorSelection::Print
+                            } else {
+                                EditorSelection::Configured
+                            }
+                        },
+                        EditorSelection::Explicit,
+                    ),
+                })
+            }
             "edit" => {
                 if title.is_none() && note.is_none() && done_when.is_none() {
                     return Err(ArgError::Requires(
