@@ -129,8 +129,7 @@ export function WebFloorShell() {
     markRevealed(reveal);
     selectAgent(reveal);
     if (hire.outcome?.kind === 'complete') {
-      hireDialog.current?.close();
-      setHiring(false);
+      closeHire(true);
       setGuide('closed');
       setFocused(false);
       setArchiveHireKept(false);
@@ -176,7 +175,7 @@ export function WebFloorShell() {
     const onShortcut = (event: KeyboardEvent) => {
       const target = event.target;
       const blocked = target instanceof Element && target.closest(
-        '.terminal-panel, .hire-wizard, .first-run-guide, input, textarea, select',
+        '.terminal-panel, .hire-wizard, .ticket-dialog, .first-run-guide, input, textarea, select',
       ) !== null;
       if (!isFocusShortcut(event, blocked)) return;
       event.preventDefault();
@@ -242,12 +241,17 @@ export function WebFloorShell() {
     setHiring(true);
   }
 
-  function closeHire(): void {
+  function closeHire(revealed = false): void {
     backdropPress.current = null;
     hireDialog.current?.close();
     setHiring(false);
-    restoreFocusAfterDialog(hireOpener.current,
-      document.getElementById('hire-open') ?? document.getElementById('crew-toggle'));
+    const ticketDialog = document.getElementById('selected-card-detail');
+    const ticketFallback = ticketDialog?.getAttribute('open') != null
+      ? ticketDialog.querySelector<HTMLElement>('.ticket-dialog-close') : null;
+    if (!revealed || ticketFallback !== null) {
+      restoreFocusAfterDialog(hireOpener.current,
+        ticketFallback ?? document.getElementById('hire-open') ?? document.getElementById('crew-toggle'));
+    }
   }
 
   useEffect(() => {
@@ -404,7 +408,7 @@ export function WebFloorShell() {
         }}
         onPointerCancel={() => { backdropPress.current = null; }}>
         {archiveHireKept ? <p role="status">The current Hire is kept. Resolve it before preparing another agent.</p> : null}
-        <HireWizard floor={floor} onClose={closeHire} />
+        <HireWizard floor={floor} onClose={() => closeHire()} />
       </dialog> : null}
     </main>
   );

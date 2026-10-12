@@ -132,6 +132,28 @@ test('an empty ticket board gives one next step in every labelled lane', () => {
   }
 });
 
+test('cards show the recorded agent colour, later rounds and a stopping ticket', () => {
+  subscribe(store, { agents: [agent(ADA, 'Ada', { accent: 'mint' })], cards: [
+    ticketCard(1, 'doing', { claimed_by: ADA }, { round: 2 }),
+    ticketCard(2, 'todo', {}, { stopping: true }),
+  ] });
+  const html = board();
+  assert.match(html, /class="ticket-avatar" aria-hidden="true" style="--agent:#27846f">A<\/span>/);
+  assert.match(html, /Round 2/);
+  assert.match(html, /Stopping…/);
+  assert.match(html, /Stopping: the agent is finishing its current step\./);
+  assert.match(html, /aria-haspopup="dialog"/);
+});
+
+test('Needs-you cards carry their later round and stopping metadata', () => {
+  subscribe(store, { agents: [agent()], cards: [
+    ticketCard(1, 'blocked', { claimed_by: ADA }, { round: 2, stopping: true, reason: 'held_unsure' }),
+  ] });
+  const lane = board().match(/<section[^>]*data-lane="needs-you"[\s\S]*?<\/section>/)?.[0];
+  assert.ok(lane);
+  assert.match(lane, /class="ticket-card-meta"[\s\S]*?Stopping…[\s\S]*?Round 2/);
+});
+
 test('a card says its title, its agent, its place in line and why it waits', () => {
   subscribe(store, {
     agents: [agent(ADA, 'Ada', { status: 'running' }), agent(GRACE, 'Grace', { paused: true })],
