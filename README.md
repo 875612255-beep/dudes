@@ -116,6 +116,13 @@ If `dudes` runs something else, check `type dudes` for an alias or shell functio
 
 ## What agents can do on your machine
 
+Dudes' installed binaries use local connections by default. Usage and error
+information can pass through those local connections. A custom Windows
+`DUDES_SOCK` path can select a remote named-pipe server. Engines and other programs
+Dudes runs can make their own network connections.
+[What Dudes and its engines send](TELEMETRY.md) explains the boundary, engine
+telemetry controls, and the installer downloads.
+
 Dudes runs every agent and every completion check as your user account. It adds no sandbox of its
 own. Before you hire an agent, know what each engine can reach:
 
