@@ -55,6 +55,7 @@ pub mod doctor;
 pub mod effect;
 pub mod host;
 pub mod input;
+mod launch_admission;
 pub mod machine;
 mod predicate_evidence;
 // Off in a default build. `src/testing.rs`'s header owns the reason; `cfg(test)` is here because
@@ -69,13 +70,15 @@ pub use agent_fsm::FsmEvent;
 pub use doctor::KeyHealth;
 pub use effect::Effect;
 pub use host::{
-    AdoptionKey, Clock, HostBoot, KillOutcome, Liveness, ProbeAnswer, ProcessHost, Rng,
-    SpawnResult, blake3_hex, closing_input_digest, input_digest, key_is_interpretable, liveness,
-    session_id_from_ulid,
+    AdoptionKey, Clock, HostBoot, KillOutcome, Liveness, MAX_OWNED_TARGET_QUERY_ROWS,
+    NativeBoundaryAcknowledgement, NativeBoundaryReceipt, OwnedTargetEvidence, OwnedTargetState,
+    OwnedTargets, OwnedTargetsStatus, ProbeAnswer, ProcessHost, Rng, SpawnResult, blake3_hex,
+    closing_input_digest, input_digest, key_is_interpretable, liveness, session_id_from_ulid,
 };
 pub use input::{
     BrowserAnswerCommand, ClientId, Command, HookId, Input, PersistToken, RuntimeSignal, SpendView,
 };
-pub use machine::{Config, Supervisor};
+pub use launch_admission::SharedFolderRefusal;
+pub use machine::{Config, InstructionSource, Supervisor};
 pub use predicate_evidence::predicate_evidence_eligible;
 pub use world::{MintedFor, WorktreeRow, WorktreeState, World};

@@ -188,14 +188,131 @@ impl<H: ProcessHost, P: PredicateRunner, C: Clock> Ctx<H, P, C> {
         queue: &mut std::collections::VecDeque<Input>,
         sup: &mut Supervisor<super::Shared<C>, R>,
     ) -> Result<()> {
-        let generation = self
-            .resolved_browser_turn
-            .filter(|(prepared, _)| *prepared == turn)
-            .map(|(_, generation)| generation);
-        if !sup.claim_browser_dispatch(turn, generation) {
+        let row = sup
+            .world()
+            .turns
+            .get(&turn)
+            .ok_or_else(|| anyhow::anyhow!("managed launch turn is unavailable"))?;
+        let agent = row.agent;
+        let owner = sup
+            .world()
+            .agents
+            .get(&agent)
+            .ok_or_else(|| anyhow::anyhow!("managed launch owner is unavailable"))?;
+        if let Err(refusal) = self
+            .admit_prior_attempt(sup, agent, Some(turn))
+            .and_then(|()| {
+                self.admit_shared_folder(
+                    sup,
+                    Some(agent),
+                    owner.provider,
+                    owner.mcp.isolation,
+                    dudes_types::Mode::Managed,
+                    &spec.cwd,
+                )
+            })
+        {
+            queue.push_back(Input::LaunchAdmissionRefused {
+                agent,
+                turn: Some(turn),
+                refusal,
+                dispatch_token: None,
+            });
             return Ok(());
         }
-        let prepared = if generation.is_some() {
+        self.spawn_owned(turn, spec, install, mcp_grant, queue, sup)
+    }
+
+    pub(super) fn dispatch_browser_intent<R: Rng>(
+        &mut self,
+        effect: &dudes_supervisor::Effect,
+        queue: &mut std::collections::VecDeque<Input>,
+        sup: &mut Supervisor<super::Shared<C>, R>,
+        closing: &mut crate::closing::Waiting,
+    ) -> Result<()> {
+        let dudes_supervisor::Effect::Persist { token, entry } = effect else {
+            anyhow::bail!("browser dispatch requires a persist effect");
+        };
+        let dudes_proto::Record::BrowserNoteDispatchIntent { agent, turn, .. } = &entry.record
+        else {
+            anyhow::bail!("browser dispatch requires its exact intent record");
+        };
+        if queue.iter().any(|input| {
+            matches!(
+                input,
+                Input::Persisted { .. } | Input::Journaled { .. } | Input::Replayed { .. }
+            )
+        }) {
+            queue.push_back(Input::BrowserDispatchAdmissionReady {
+                token: *token,
+                turn: *turn,
+            });
+            return Ok(());
+        }
+        let spec = sup
+            .browser_dispatch_spec(*token, *turn)
+            .ok_or_else(|| anyhow::anyhow!("browser dispatch token is stale or mismatched"))?;
+        let owner = sup
+            .world()
+            .agents
+            .get(agent)
+            .ok_or_else(|| anyhow::anyhow!("browser dispatch owner is unavailable"))?;
+        if let Err(refusal) = self
+            .admit_prior_attempt(sup, *agent, Some(*turn))
+            .and_then(|()| {
+                self.admit_shared_folder(
+                    sup,
+                    Some(*agent),
+                    owner.provider,
+                    owner.mcp.isolation,
+                    dudes_types::Mode::Managed,
+                    &spec.cwd,
+                )
+            })
+        {
+            queue.push_back(Input::LaunchAdmissionRefused {
+                agent: *agent,
+                turn: Some(*turn),
+                refusal,
+                dispatch_token: Some(*token),
+            });
+            return Ok(());
+        }
+        let lsn = self.append(sup.world(), entry)?;
+        anyhow::ensure!(
+            self.writer.poisoned().is_none(),
+            "browser dispatch journal stopped after its append"
+        );
+        sup.handle(Input::Persisted { token: *token, lsn });
+        self.tokens.mark_folded();
+        self.publish_folded_floor(sup.world(), closing)?;
+        let effects = sup.take_effects();
+        let [
+            dudes_supervisor::Effect::Spawn {
+                turn: issued,
+                spec,
+                install,
+                mcp_grant,
+            },
+        ] = effects.as_slice()
+        else {
+            anyhow::bail!("browser intent acknowledgment did not yield its one prepared launch");
+        };
+        anyhow::ensure!(*issued == *turn, "browser intent yielded a different turn");
+        self.tokens
+            .publish_completed_folds(|| sup.world().token_hash_owners());
+        self.spawn_owned(*issued, spec, install, *mcp_grant, queue, sup)
+    }
+
+    fn prepare_owned_launch<R: Rng>(
+        &mut self,
+        turn: dudes_types::TurnId,
+        spec: &dudes_providers::launch::LaunchSpec,
+        mcp_grant: Option<dudes_types::Lsn>,
+        already_resolved: bool,
+        sup: &Supervisor<super::Shared<C>, R>,
+    ) -> std::io::Result<dudes_providers::launch::LaunchSpec> {
+        if already_resolved {
             Ok(spec.clone())
         } else {
             crate::program::resolve_launch(spec.clone())
@@ -231,13 +348,41 @@ impl<H: ProcessHost, P: PredicateRunner, C: Clock> Ctx<H, P, C> {
             self.children
                 .read_next_for(super::turn_reader(sup, turn, &spec), &spec, mcp_grant);
             Ok(spec)
-        });
+        })
+    }
+
+    fn spawn_owned<R: Rng>(
+        &mut self,
+        turn: dudes_types::TurnId,
+        spec: &dudes_providers::launch::LaunchSpec,
+        install: &dudes_providers::adapter::ManagedInstall,
+        mcp_grant: Option<dudes_types::Lsn>,
+        queue: &mut std::collections::VecDeque<Input>,
+        sup: &mut Supervisor<super::Shared<C>, R>,
+    ) -> Result<()> {
+        let generation = self
+            .resolved_browser_turn
+            .filter(|(prepared, _)| *prepared == turn)
+            .map(|(_, generation)| generation);
+        if !sup.claim_browser_dispatch(turn, generation) {
+            return Ok(());
+        }
+        let prepared = self.prepare_owned_launch(turn, spec, mcp_grant, generation.is_some(), sup);
+        let cwd = prepared.as_ref().ok().map(|spec| spec.cwd.clone());
+        let actual_host_call = prepared.is_ok();
         match match prepared {
             Ok(spec) => self.host.spawn(&spec, install),
             Err(reason) => super::SpawnResult::NotLaunched { reason },
         } {
             super::SpawnResult::Spawned(key) => {
-                self.children.spawned(turn, &key, mcp_grant);
+                self.remember_native_launch(sup.world(), turn, &key);
+                self.children.spawned_in(
+                    turn,
+                    &key,
+                    mcp_grant,
+                    cwd.as_deref()
+                        .expect("a spawned child had a prepared execution folder"),
+                );
                 if let Some(row) = self.projections.turn(turn)?
                     && row.mode == dudes_types::Mode::Managed
                     && row.is_open()
@@ -256,13 +401,36 @@ impl<H: ProcessHost, P: PredicateRunner, C: Clock> Ctx<H, P, C> {
                 });
             }
             super::SpawnResult::NotLaunched { reason } => {
+                if actual_host_call
+                    && self.confirmed_launch_failures.len()
+                        < dudes_supervisor::host::MAX_OWNED_TARGET_QUERY_ROWS
+                    && let Some((started, attempt)) =
+                        sup.world().instructions.current_for_turn(turn)
+                {
+                    self.confirmed_launch_failures
+                        .insert(started, attempt.owner);
+                }
                 tracing::error!(error = %reason, ?turn, "the host did not launch the turn");
-                queue.push_back(Input::SpawnFailed {
-                    turn,
-                    reason: format!("managed process could not launch ({:?})", reason.kind()),
-                });
+                let reason = format!("managed process could not launch ({:?})", reason.kind());
+                if !actual_host_call
+                    && let Some((started_lsn, _)) = sup.world().instructions.current_for_turn(turn)
+                {
+                    queue.push_back(Input::LaunchPreparationFailed {
+                        turn,
+                        started_lsn,
+                        reason,
+                    });
+                } else {
+                    queue.push_back(Input::SpawnFailed { turn, reason });
+                }
             }
             super::SpawnResult::CleanupUnconfirmed { reason } => {
+                self.children.retain_uncertain(
+                    turn,
+                    cwd.as_deref()
+                        .expect("unconfirmed cleanup followed a prepared launch"),
+                );
+                queue.push_back(Input::InstructionLaunchCleanupUnconfirmed { turn });
                 tracing::error!(error = %reason, ?turn, "the host could not confirm cleanup after a failed launch");
             }
         }
@@ -384,6 +552,7 @@ pub(super) fn ticket_session(record: &dudes_proto::Record) -> Option<dudes_proto
     let (Record::TicketCreated { by, .. }
     | Record::TicketEdited { by, .. }
     | Record::TicketAssigned { by, .. }
+    | Record::TicketInstructionReviewed { by, .. }
     | Record::TicketRemoved { by, .. }
     | Record::CardTransition { by, .. }) = record
     else {

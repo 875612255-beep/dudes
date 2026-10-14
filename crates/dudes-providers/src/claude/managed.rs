@@ -30,8 +30,8 @@ use dudes_types::{AgentId, ModelSelection, Provider, Tier};
 use serde_json::{Map, Value};
 
 use crate::adapter::{
-    Adapter, AgentCtx, HookInstall, Isolation, ManagedInstall, SessionAcquisition, TurnSession,
-    UsageSource,
+    Adapter, AgentCtx, ContextMode, HookInstall, Isolation, ManagedInstall, SessionAcquisition,
+    TurnSession, UsageSource,
 };
 use dudes_types::IsolationMode;
 
@@ -503,6 +503,64 @@ impl Adapter for ClaudeAdapter {
             IsolationMode::Bare => Isolation::Flags(BARE_FLAG),
             IsolationMode::Inherit => Isolation::None,
         }
+    }
+
+    fn context_mode(&self, mode: dudes_types::Mode) -> ContextMode {
+        match mode {
+            dudes_types::Mode::Managed => ContextMode::ClaudeManaged(self.config.isolation),
+            dudes_types::Mode::Attached => ContextMode::ClaudeAttached,
+        }
+    }
+
+    fn instruction_manifest(
+        &self,
+        ctx: &AgentCtx<'_>,
+        mode: dudes_types::Mode,
+        selection: &ModelSelection,
+    ) -> crate::instructions::InstructionDeclaration {
+        use crate::instructions::{ClaudeSources, DeclarationMode, claude_manifest};
+
+        if mode == dudes_types::Mode::Attached {
+            return claude_manifest(
+                ctx,
+                DeclarationMode::ClaudeAttached,
+                ClaudeSources::Inherit,
+                &[],
+                crate::instructions::validate_path(ctx.agent_dir).map(|()| {
+                    Some(
+                        hooks::settings_path(ctx)
+                            .strip_prefix(ctx.agent_dir)
+                            .expect("hook settings are agent-owned")
+                            .to_owned(),
+                    )
+                }),
+            );
+        }
+        let resolved = if self.config.isolation == IsolationMode::Default
+            && self.config.setting_sources.as_ref().is_some_and(|sources| {
+                sources.len() > dudes_proto::instruction::MAX_INSTRUCTION_INPUTS
+            }) {
+            None
+        } else {
+            Some(self.setting_sources(ctx.trusted, EMPTY_SETTING_SOURCES_SUPPORTED))
+        };
+        let sources = match &resolved {
+            Some(Ok(Some(selected))) => ClaudeSources::Selected(selected),
+            Some(Ok(None)) if self.config.isolation == IsolationMode::Bare => ClaudeSources::Bare,
+            Some(Ok(None)) => ClaudeSources::Inherit,
+            Some(Err(_)) => ClaudeSources::Refused,
+            None => ClaudeSources::Unresolved,
+        };
+        let settings = (self.config.isolation == IsolationMode::Default
+            || selection.selector().is_some())
+        .then(|| MANAGED_SETTINGS_FILE.into());
+        claude_manifest(
+            ctx,
+            DeclarationMode::ClaudeManaged(self.config.isolation),
+            sources,
+            &self.config.extra_args,
+            Ok(settings),
+        )
     }
 
     /// The configured selector, copied rather than interpreted: an unset `model` is the provider's

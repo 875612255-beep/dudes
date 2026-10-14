@@ -45,7 +45,8 @@ use std::io;
 use dudes_providers::adapter::{HookInstall, ManagedInstall};
 use dudes_providers::launch::LaunchSpec;
 use dudes_supervisor::host::{
-    AdoptionKey, HostBoot, KillOutcome, Liveness, ProcessHost, SpawnResult,
+    AdoptionKey, HostBoot, KillOutcome, Liveness, NativeBoundaryAcknowledgement,
+    NativeBoundaryReceipt, OwnedTargets, ProcessHost, SpawnResult,
 };
 use dudes_supervisor::{MintedFor, World, blake3_hex};
 use dudes_types::AgentId;
@@ -766,6 +767,18 @@ impl<H: ProcessHost> ProcessHost for PeerBarrier<H> {
         self.inner.alive(key)
     }
 
+    fn owned_targets(&self, limit: usize) -> OwnedTargets {
+        self.inner.owned_targets(limit)
+    }
+
+    fn acknowledge_native_boundary_absence(
+        &mut self,
+        key: &AdoptionKey,
+        receipt: &NativeBoundaryReceipt,
+    ) -> NativeBoundaryAcknowledgement {
+        self.inner.acknowledge_native_boundary_absence(key, receipt)
+    }
+
     fn boot_identity(&self) -> HostBoot {
         self.inner.boot_identity()
     }
@@ -793,7 +806,13 @@ impl<H: ProcessHost> ProcessHost for PeerBarrier<H> {
 pub(crate) struct PtyBarrier {
     inner: Box<dyn PtyHostPort>,
     resolver: Resolver,
-    tracked: BTreeMap<PtyId, Box<dyn ExternalChild>>,
+    tracked: BTreeMap<PtyId, TrackedPty>,
+}
+
+struct TrackedPty {
+    _child: Box<dyn ExternalChild>,
+    key: AdoptionKey,
+    cwd: std::path::PathBuf,
 }
 
 impl PtyBarrier {
@@ -812,6 +831,7 @@ impl PtyBarrier {
         cols: u16,
         rows: u16,
     ) -> Result<(PtyId, Option<AdoptionKey>), PtyOpenFailure> {
+        let cwd = spec.cwd.clone();
         let Some(mut spawn) = self.resolver.begin_external() else {
             #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
             {
@@ -845,7 +865,14 @@ impl PtyBarrier {
         });
         match registered {
             Ok(key) => {
-                self.tracked.insert(pty, spawn.child);
+                self.tracked.insert(
+                    pty,
+                    TrackedPty {
+                        _child: spawn.child,
+                        key: key.clone(),
+                        cwd,
+                    },
+                );
                 Ok((pty, Some(key)))
             }
             // Closed before the barrier aborts, so a peer of the child waits out the close.
@@ -864,6 +891,12 @@ impl PtyBarrier {
                 Err(failure)
             }
         }
+    }
+
+    pub(crate) fn receipt(&self, pty: PtyId) -> Option<(&AdoptionKey, &std::path::Path)> {
+        self.tracked
+            .get(&pty)
+            .map(|child| (&child.key, child.cwd.as_path()))
     }
 
     pub(crate) fn write(&mut self, pty: PtyId, bytes: &[u8]) -> io::Result<usize> {
@@ -888,6 +921,30 @@ impl PtyBarrier {
             self.tracked.remove(&pty);
         }
         outcome
+    }
+
+    pub(crate) fn track_native_close(
+        &mut self,
+        pty: PtyId,
+    ) -> Result<dudes_supervisor::host::NativeBoundaryReceipt, crate::ports::PtyNativeBoundaryUnknown>
+    {
+        self.inner.track_native_close(pty)
+    }
+
+    pub(crate) fn native_close_absence(
+        &mut self,
+        pty: PtyId,
+        identity: &dudes_supervisor::host::NativeBoundaryReceipt,
+    ) -> Result<(), crate::ports::PtyNativeBoundaryUnknown> {
+        self.inner.native_close_absence(pty, identity)
+    }
+
+    pub(crate) fn acknowledge_native_close(
+        &mut self,
+        pty: PtyId,
+        identity: &dudes_supervisor::host::NativeBoundaryReceipt,
+    ) -> bool {
+        self.inner.acknowledge_native_close(pty, identity)
     }
 
     pub(crate) fn shutdown(&mut self) -> io::Result<()> {
