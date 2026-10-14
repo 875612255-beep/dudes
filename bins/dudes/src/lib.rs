@@ -58,12 +58,15 @@ mod editor;
 pub mod env;
 pub mod exit;
 pub mod floor;
+mod layout;
+mod lifecycle;
 pub mod login;
 mod mail;
 mod quickstart;
 pub mod render;
 pub mod run;
 pub mod setup;
+mod uninstall;
 pub mod workspace;
 
 pub use call::call_presenting;

@@ -47,8 +47,46 @@ find ~/.codex/shell_snapshots ~/.local/share/dudes/providers/codex/shell_snapsho
 
 ## Uninstall Dudes
 
-The state directory holds agent worktrees. If you delete it first, you lose any uncommitted agent
-work, and your repositories keep stale worktree entries. Remove Dudes in this order:
+Run `dudes uninstall` on macOS or Linux. It prints every path it will delete with its size, asks
+for confirmation on a terminal, and deletes in a safe order: the daemon is stopped, then the
+runtime directory, the state directory, the operator file, and last the three programs, so you can
+run it again if something fails part way.
+
+```sh
+dudes uninstall
+```
+
+- **Agent worktrees stop it.** While any tree exists under `worktrees/` in the state directory,
+  `dudes uninstall` deletes nothing. It prints the repository each tree belongs to and the git
+  commands from steps 3 and 4 below, so you can review and remove each tree first.
+- **A running daemon is stopped first**, the way `dudes stop` does it. If an agent is running a
+  turn, waiting for your answer or attached to your own session, it refuses and names each one.
+  `--now` stops the daemon with closing time anyway, which gives every agent up to 6 minutes to
+  save its work. To end turns at once, run `dudes stop --hard` first.
+- **Without a terminal it needs `--yes`.** `--dry-run` prints the plan and deletes nothing.
+  Answering no at the prompt changes nothing and exits 0.
+- **Guards.** It touches a data directory only at its default path, or at a `DUDES_STATE_DIR` or
+  `DUDES_RUNTIME_DIR` whose content only Dudes writes. In a folder that a setting chose, including
+  the operator file's folder, it deletes only the files Dudes writes and removes the folder only if
+  that leaves it empty; anything else stays, and it says what. It never deletes the filesystem
+  root, your home directory, a parent of it, or a symbolic link. With `DUDES_CONFIG` set it deletes
+  only that file, and only if it reads as an operator file.
+- **Programs.** It deletes `duded`, `dudes` and `dudes-hook` only when this copy was put there by
+  `install.sh`. For a source build, `cargo install` or a link, it removes the data, leaves the
+  programs and prints the commands to remove them by hand.
+- **Exit codes.** A deliberate refusal exits 3, and a failure part way exits 4 and lists what
+  remains. Run the command again once the cause is fixed.
+- **It cannot clean up everything.** It prints, and does not do, the cleanup that lies outside
+  Dudes: the engines' own session history, Codex shell snapshots that hold a `DUDES_TOKEN=` line,
+  and your browser's site data for the Floor.
+
+`dudes uninstall` is not supported on Windows yet; follow the steps below there.
+
+### Uninstall by hand
+
+If `dudes uninstall` is not available, or you want to do it yourself, remember that the state
+directory holds agent worktrees. If you delete it first, you lose any uncommitted agent work, and
+your repositories keep stale worktree entries. Remove Dudes in this order:
 
 1. Stop the daemon. To see which agent owns each worktree, run `dudes worktree list` first.
    `dudes stop --hard` ends running turns at once instead of waiting for closing time.

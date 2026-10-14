@@ -143,6 +143,7 @@ pub fn run(
             select_hire(params, invocation.json, terminal, env, out, err)
         }
         Command::Login(provider) => login(*provider, terminal.is_some(), env, out),
+        Command::Uninstall(options) => uninstall_command(*options, terminal, env, out, err),
         Command::Mail(command) => crate::mail::run(command, env, out)
             .map(|()| exit::SUCCESS)
             .map_err(local),
@@ -158,6 +159,85 @@ pub fn run(
             let _ = failure.render(invocation.json, err);
             failure.code()
         }
+    }
+}
+
+/// `dudes uninstall`, with the daemon reached through the operator door.
+fn uninstall_command(
+    options: args::UninstallOptions,
+    terminal: Option<&mut dyn BufRead>,
+    env: &Environment,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<u8, Failure> {
+    if cfg!(windows) {
+        render::local_error(
+            err,
+            "dudes uninstall is not supported on Windows yet; follow the manual steps in \
+             https://github.com/ArcfluxResearch/dudes/blob/main/docs/data-and-uninstall.md",
+        )
+        .map_err(local)?;
+        return Ok(exit::REFUSED);
+    }
+    if env.agent_token().is_some() {
+        render::local_error(
+            err,
+            "uninstall is for the operator and refuses to run with an agent's DUDES_TOKEN set",
+        )
+        .map_err(local)?;
+        return Ok(exit::REFUSED);
+    }
+    let layout = crate::uninstall::Layout {
+        home: env
+            .home()
+            .ok_or_else(|| local("HOME is not set to an absolute path"))?
+            .to_path_buf(),
+        state_dir: env.state_dir().map_err(local)?.to_path_buf(),
+        runtime_dir: env.runtime_dir().map_err(local)?.to_path_buf(),
+        config: env.config().map_err(local)?.to_path_buf(),
+        config_overridden: env.config_overridden(),
+        executable: std::env::current_exe().map_err(local)?,
+        lock_wait: Duration::from_secs(5),
+    };
+    Ok(crate::uninstall::run(
+        &layout,
+        options,
+        terminal,
+        &Lifecycle(env),
+        out,
+        err,
+    ))
+}
+
+/// The daemon `uninstall` and `upgrade` ask, through the same calls `dudes stop` and
+/// `dudes worktree list` make.
+struct Lifecycle<'a>(&'a Environment);
+
+impl crate::lifecycle::Daemon for Lifecycle<'_> {
+    fn running(&self) -> bool {
+        ping_once(self.0).is_ok()
+    }
+
+    fn busy_agents(&self) -> Result<Vec<String>, String> {
+        let agents = operator_call(self.0, Method::AgentList, None)
+            .and_then(typed::<Vec<dudes_proto::AgentView>>)
+            .map_err(|failure| failure.message().to_owned())?;
+        Ok(crate::lifecycle::agents_busy(&agents))
+    }
+
+    fn stop(&self, out: &mut dyn Write, err: &mut dyn Write) -> Result<(), String> {
+        stop_closing(false, self.0, out, err)
+            .map(|_| ())
+            .map_err(|failure| failure.message().to_owned())
+    }
+}
+
+impl crate::uninstall::Owned for Lifecycle<'_> {
+    fn worktrees(&self) -> Result<Vec<PathBuf>, String> {
+        operator_call(self.0, Method::WorktreeList, None)
+            .and_then(typed::<Vec<dudes_proto::rpc::worktree::WorktreeEntry>>)
+            .map(|entries| entries.into_iter().map(|entry| entry.path).collect())
+            .map_err(|failure| failure.message().to_owned())
     }
 }
 
@@ -1867,6 +1947,7 @@ fn wire(command: &Command) -> Result<(Method, Option<Value>), Failure> {
         | Command::Workspace(_)
         | Command::Worktree(_)
         | Command::Config(_)
+        | Command::Uninstall(_)
         | Command::Ticket(_)
         | Command::Mail(_) => {
             return Err(Failure::Other(Message::Local(

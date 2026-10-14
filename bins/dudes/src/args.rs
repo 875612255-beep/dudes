@@ -149,6 +149,19 @@ pub enum Command {
     Worktree(WorktreeCommand),
     /// `config`: show or edit the operator file's start-time settings. Local; nothing is sent.
     Config(ConfigCommand),
+    /// Remove Dudes, its data and its programs from this machine.
+    Uninstall(UninstallOptions),
+}
+
+/// The flags of `uninstall`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UninstallOptions {
+    /// Skip the confirmation question.
+    pub yes: bool,
+    /// Print what would be removed and remove nothing.
+    pub dry_run: bool,
+    /// Stop a daemon whose agents are mid-turn, ending those turns at once.
+    pub now: bool,
 }
 
 /// One `config` subcommand.
@@ -559,6 +572,26 @@ COMMANDS
         a managed turn it warns that it cannot prove nothing an agent process
         started left its process group or job; that warning alone is success.
         Any other teardown failure is an error.
+
+    uninstall [--dry-run] [--yes] [--now]
+        Remove Dudes from this machine: the state and runtime directories, the operator
+        file, and, for a copy that install.sh installed, the duded, dudes and dudes-hook
+        programs and the Floor and licence notices in <prefix>/share/dudes. It prints every
+        path and its size first, then asks y/N on a terminal; without a terminal it needs
+        --yes. --dry-run prints the plan and removes nothing. It refuses, and removes
+        nothing, while any agent worktree exists, because a tree can hold the only copy of
+        an agent's work; it prints the git commands to review and remove each one. A running
+        daemon is stopped the way dudes stop does it. It refuses while an agent is running a
+        turn, waiting for an answer or attached to a person's session, and names each one;
+        --now stops with closing time anyway, which gives every agent up to 6 minutes to save
+        its work, and dudes stop --hard first ends turns at once. In a folder that
+        DUDES_STATE_DIR, DUDES_RUNTIME_DIR or the operator file's location chose, it deletes only
+        the files Dudes writes and removes the folder only if that leaves it empty. It never
+        deletes the home directory, a parent of it or a symbolic link, and with DUDES_CONFIG set
+        only that file, and only if it is an operator file. For a copy that install.sh did not
+        install it leaves the programs and prints how to remove them. It prints the cleanup it
+        cannot do for you: engine history, Codex shell snapshots and the browser's site data for
+        the Floor. Not supported on Windows yet.
 
     closing ack --announcement-lsn <lsn>
         Acknowledge your own participation using DUDES_TOKEN. The daemon derives
@@ -995,6 +1028,8 @@ fn parse_global(argv: &[OsString]) -> Result<Invocation, ArgError> {
         "ticket" => Command::Ticket(ticket(tail, json)?),
         "config" if json => return Err(ArgError::TextOnly("config")),
         "config" => Command::Config(config_command(tail)?),
+        "uninstall" if json => return Err(ArgError::TextOnly("uninstall")),
+        "uninstall" => Command::Uninstall(uninstall(tail)?),
         other => return Err(ArgError::UnknownCommand(other.to_owned())),
     };
     Ok(Invocation { json, command })
@@ -1301,6 +1336,21 @@ fn stop(tail: &[OsString]) -> Result<Command, ArgError> {
     } else {
         Command::Stop
     })
+}
+
+fn uninstall(tail: &[OsString]) -> Result<UninstallOptions, ArgError> {
+    let mut flags = Flags::new(tail);
+    let mut options = UninstallOptions::default();
+    while let Some(arg) = flags.next() {
+        match arg.to_string_lossy().as_ref() {
+            "--yes" => options.yes = true,
+            "--dry-run" => options.dry_run = true,
+            "--now" => options.now = true,
+            "--help" | "-h" => return Err(ArgError::HelpRequested),
+            other => return Err(ArgError::UnknownFlag(other.to_owned())),
+        }
+    }
+    Ok(options)
 }
 
 fn closing(tail: &[OsString]) -> Result<Command, ArgError> {
@@ -3792,6 +3842,32 @@ mod closing_tests {
             Command::Start
         );
         assert!(parse_line(&["start", "--hire", "ada"]).is_err());
+    }
+
+    #[test]
+    fn uninstall_takes_three_flags_and_nothing_else() {
+        assert_eq!(
+            parse_line(&["uninstall"]).unwrap().command,
+            Command::Uninstall(UninstallOptions::default())
+        );
+        assert_eq!(
+            parse_line(&["uninstall", "--yes", "--dry-run", "--now"])
+                .unwrap()
+                .command,
+            Command::Uninstall(UninstallOptions {
+                yes: true,
+                dry_run: true,
+                now: true
+            })
+        );
+        assert_eq!(
+            parse_line(&["uninstall", "--force"]),
+            Err(ArgError::UnknownFlag("--force".to_owned()))
+        );
+        assert_eq!(
+            parse_line(&["--json", "uninstall"]),
+            Err(ArgError::TextOnly("uninstall"))
+        );
     }
 
     #[test]
