@@ -16,7 +16,7 @@ use crate::instruction::{
     InstructionReviewInterval, InstructionReviewWatermark, InstructionSettlement,
     InstructionSnapshot, InstructionTicketAssociation, InstructionUnknownReason,
     InstructionValidationError, MAX_INSTRUCTION_INPUTS, MAX_INSTRUCTION_METADATA_BYTES,
-    validate_instruction_record,
+    TicketCoverageNote, validate_instruction_record,
 };
 use crate::record::{Entry, Hex32, Record};
 use crate::ticket::TicketReason;
@@ -84,6 +84,8 @@ pub struct InstructionFold {
     pub reviewed: Option<(CardId, InstructionReviewAction)>,
     /// Validated goal clearing carried by the atomic rework record. Never set by acceptance.
     pub cleared_goal: Option<InstructionGoalClear>,
+    /// A finished ticket interval that holds nothing but met standing engine limits.
+    pub coverage_note: Option<(CardId, TicketCoverageNote)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,6 +274,7 @@ impl InstructionState {
             } => {
                 if self.finish_attempt(lsn, *owner, *ticket, *baseline, settlement)? {
                     note_card(&mut folded.evidence_cards, *ticket);
+                    folded.coverage_note = self.coverage_note(baseline_key(*baseline));
                 }
             }
             Record::TicketInstructionReviewed {
@@ -433,6 +436,30 @@ impl InstructionState {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    fn coverage_note(&self, key: Lsn) -> Option<(CardId, TicketCoverageNote)> {
+        let attempt = self.attempts.get(&key)?;
+        let ticket = attempt.ticket?;
+        let InstructionSettlement::Compared { comparison, .. } =
+            &attempt.finished.as_ref()?.settlement
+        else {
+            return None;
+        };
+        let agent = owner_agent(attempt.owner);
+        let provider = attempt.snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .participants
+                .iter()
+                .find(|participant| participant.agent == agent)
+                .map(|participant| participant.provider)
+        });
+        let note = TicketCoverageNote::from_comparison(comparison, provider);
+        if requires_review(attempt) {
+            // A held interval keeps the limits already noted but withdraws any claim of no change.
+            return Some((ticket.card, TicketCoverageNote::withdrawn(note, provider)));
+        }
+        note.map(|note| (ticket.card, note))
     }
 
     /// Every durable attempt in canonical position order, including reviewed uncertainty.
@@ -1532,6 +1559,7 @@ mod tests {
                 comparison: InstructionComparison {
                     changes: Vec::new(),
                     gaps: vec![InstructionCoverageGap {
+                        origin: crate::instruction::InstructionGapOrigin::Observed,
                         reason: InstructionGapKind::UnrecordedLaunchBoundary,
                         context: InstructionPathContext::SharedProject,
                         agent: Some(samples::agent()),
@@ -1566,6 +1594,181 @@ mod tests {
             completed_lsn: None,
             clear_goal: None,
         }
+    }
+
+    fn gap_of(
+        origin: crate::instruction::InstructionGapOrigin,
+        reason: InstructionGapKind,
+    ) -> InstructionCoverageGap {
+        InstructionCoverageGap {
+            origin,
+            reason,
+            context: InstructionPathContext::SharedInput {
+                source: crate::instruction::InstructionSharedInput::Profile,
+            },
+            agent: Some(samples::agent()),
+            path: None,
+        }
+    }
+
+    fn finish_ticket(gaps: Vec<InstructionCoverageGap>) -> (InstructionState, InstructionFold) {
+        let mut state = seeded();
+        let issue = InstructionIssueAssociation::Prospective;
+        state
+            .apply(Lsn(4), &stamp(start(issue)), None, hash)
+            .unwrap();
+        for (lsn, kind) in [(5, RecordKind::TurnIssued), (6, RecordKind::TurnEnded)] {
+            state
+                .apply(Lsn(lsn), &stamp(samples::record(kind)), None, hash)
+                .unwrap();
+        }
+        let finished = Record::InstructionObservationFinished {
+            owner: owner(issue),
+            ticket: Some(ticket()),
+            baseline: InstructionBaselineRef::Started { lsn: Lsn(4) },
+            settlement: InstructionSettlement::Compared {
+                end: InstructionEndBoundary::ManagedTurn {
+                    turn: samples::turn(),
+                    end_lsn: Lsn(6),
+                },
+                sampled_at: Timestamp::UNIX_EPOCH,
+                recovery: false,
+                comparison: InstructionComparison {
+                    changes: Vec::new(),
+                    gaps,
+                    usage: crate::InstructionSampleUsage::default(),
+                },
+            },
+        };
+        let folded = state.apply(Lsn(7), &stamp(finished), None, hash).unwrap();
+        (state, folded)
+    }
+
+    #[test]
+    fn standing_engine_limits_annotate_a_passing_ticket_without_holding_it() {
+        use crate::instruction::InstructionGapOrigin::{Declared, Observed};
+        let (state, folded) = finish_ticket(vec![
+            gap_of(Declared, InstructionGapKind::ConfigurationUnknown),
+            gap_of(Declared, InstructionGapKind::FallbackUnknown),
+        ]);
+        assert!(!state.pending_for_goal(samples::goal()));
+        assert_eq!(state.ticket_reason(samples::card()), None);
+        assert_eq!(state.review(samples::card(), hash).unwrap(), None);
+        let (card, note) = folded.coverage_note.expect("the standing limits are noted");
+        assert_eq!(card, samples::card());
+        assert!(note.saw_no_change);
+        assert_eq!(
+            note.limits,
+            [
+                InstructionGapKind::ConfigurationUnknown,
+                InstructionGapKind::FallbackUnknown
+            ]
+        );
+
+        let (state, folded) = finish_ticket(vec![
+            gap_of(Declared, InstructionGapKind::ConfigurationUnknown),
+            gap_of(Observed, InstructionGapKind::ConfigurationUnknown),
+        ]);
+        assert!(
+            state.pending_for_goal(samples::goal()),
+            "an observed gap equal to a declared one except for origin still holds"
+        );
+        assert_eq!(
+            state.ticket_reason(samples::card()),
+            Some(TicketReason::SharedInstructionsUnknown)
+        );
+        let (_, held) = folded.coverage_note.expect("a held interval still reports");
+        assert!(!held.saw_no_change);
+    }
+
+    #[test]
+    fn a_pi_note_has_plain_words_for_every_limit_it_carries() {
+        let note = TicketCoverageNote {
+            provider: Some(dudes_types::Provider::Pi),
+            limits: vec![
+                InstructionGapKind::ConfigurationUnknown,
+                InstructionGapKind::PathUnresolved,
+            ],
+            saw_no_change: true,
+        };
+        assert_eq!(
+            note.sentence(),
+            "Dudes cannot see Pi's settings in its home folder or project folder lookup. It saw no change to the instruction and settings files it can read."
+        );
+        let sentence = TicketCoverageNote {
+            limits: vec![InstructionGapKind::PathUnresolved],
+            saw_no_change: false,
+            ..note
+        }
+        .sentence();
+        assert_eq!(sentence, "Dudes cannot see Pi's project folder lookup.");
+    }
+
+    #[test]
+    fn a_later_held_interval_withdraws_the_claim_of_no_change_and_keeps_the_limits() {
+        use crate::instruction::InstructionGapOrigin::{Declared, Observed};
+        let (_, clean) = finish_ticket(vec![gap_of(Declared, InstructionGapKind::PluginUnknown)]);
+        let mut slot = None;
+        TicketCoverageNote::absorb(&mut slot, clean.coverage_note.unwrap().1);
+        assert!(slot.as_ref().unwrap().saw_no_change);
+        let (_, held) = finish_ticket(vec![gap_of(Observed, InstructionGapKind::ReadFailed)]);
+        let (_, held_note) = held.coverage_note.expect("a held interval reports");
+        assert!(held_note.limits.is_empty());
+        TicketCoverageNote::absorb(&mut slot, held_note);
+        let note = slot.unwrap();
+        assert!(!note.saw_no_change);
+        assert_eq!(note.limits, [InstructionGapKind::PluginUnknown]);
+        let mut alone = None;
+        TicketCoverageNote::absorb(&mut alone, TicketCoverageNote::withdrawn(None, None));
+        let alone = alone.expect("a held interval alone keeps its withdrawal");
+        assert!(alone.limits.is_empty() && !alone.saw_no_change);
+    }
+
+    #[test]
+    fn a_held_interval_before_a_clean_one_keeps_the_claim_of_no_change_withdrawn() {
+        use crate::instruction::InstructionGapOrigin::{Declared, Observed};
+        let mut slot = None;
+        let (_, held) = finish_ticket(vec![gap_of(Observed, InstructionGapKind::ReadFailed)]);
+        TicketCoverageNote::absorb(
+            &mut slot,
+            held.coverage_note.expect("a held interval reports").1,
+        );
+        let (_, clean) = finish_ticket(vec![gap_of(Declared, InstructionGapKind::PluginUnknown)]);
+        TicketCoverageNote::absorb(&mut slot, clean.coverage_note.unwrap().1);
+        let note = slot.expect("the clean interval's limits are kept");
+        assert!(!note.saw_no_change);
+        assert_eq!(note.limits, [InstructionGapKind::PluginUnknown]);
+    }
+
+    #[test]
+    fn a_gap_record_without_an_origin_reads_as_observed_and_holds() {
+        let gap: InstructionCoverageGap = serde_json::from_value(serde_json::json!({
+            "reason": "configuration_unknown",
+            "context": {"kind": "unresolved"},
+            "agent": null,
+            "path": null,
+        }))
+        .unwrap();
+        assert_eq!(
+            gap.origin,
+            crate::instruction::InstructionGapOrigin::Observed
+        );
+        let (state, _) = finish_ticket(vec![gap]);
+        assert!(state.pending_for_goal(samples::goal()));
+    }
+
+    #[test]
+    fn a_note_leaves_out_the_unchanged_sentence_when_the_run_found_its_own_gap() {
+        use crate::instruction::InstructionGapOrigin::{Declared, Observed};
+        let mut local = gap_of(Observed, InstructionGapKind::ReadFailed);
+        local.context = InstructionPathContext::UnsharedProject;
+        let (_, folded) = finish_ticket(vec![
+            gap_of(Declared, InstructionGapKind::PluginUnknown),
+            local,
+        ]);
+        let (_, note) = folded.coverage_note.expect("noted");
+        assert!(!note.saw_no_change);
+        assert!(!note.sentence().contains("saw no change"));
     }
 
     #[test]
@@ -2209,6 +2412,7 @@ mod tests {
                 issue_lsn,
             };
             comparison.gaps.push(InstructionCoverageGap {
+                origin: crate::instruction::InstructionGapOrigin::Observed,
                 reason: InstructionGapKind::MissingBaseline,
                 context: InstructionPathContext::Unresolved,
                 agent: Some(samples::agent()),

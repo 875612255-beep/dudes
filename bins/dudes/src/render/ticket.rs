@@ -204,6 +204,11 @@ where
     }
     if let Some(review) = &read.ticket.instruction_review {
         instruction_evidence(out, review, zone)?;
+    } else if read.card.status == CardStatus::Review
+        && let Some(note) = &read.ticket.coverage
+        && !note.limits.is_empty()
+    {
+        writeln!(out, "Coverage: {}", note.sentence())?;
     }
     if read.ticket.round > 0 {
         writeln!(out, "Open the Floor to see the changed files.")?;

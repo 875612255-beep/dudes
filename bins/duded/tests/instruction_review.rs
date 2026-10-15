@@ -457,8 +457,11 @@ fn assert_exact_review(
 ) {
     let review = read.ticket.instruction_review.as_ref().unwrap();
     assert!(
-        !review.gaps.is_empty(),
-        "actual Claude composition keeps unresolved coverage explicit"
+        review
+            .gaps
+            .iter()
+            .any(dudes_proto::InstructionCoverageGap::holds),
+        "the idle recorded peer is an observed gap, which holds the ticket"
     );
     assert_eq!(
         review
@@ -633,4 +636,74 @@ fn healthy_unpaused_work_continues_through_ordinary_admission_after_review() {
 #[test]
 fn acknowledgment_waits_for_an_inflight_observed_completion_check() {
     managed_review(true, Completion::Fails, false, true);
+}
+
+/// An agent working beside an idle peer, so the project is shared, rewrites one of the engine's
+/// project settings files while its ticket runs. The ticket holds with the file listed.
+fn settings_edit_in_a_shared_project(edited: &str) {
+    let fixture = common::Fixture::new();
+    let project = fixture.state.path().join("project");
+    let work = fixture.state.path().join("child");
+    let home = fixture.state.path().join("owned-home");
+    for path in [&project, &work, &home] {
+        std::fs::create_dir(path).unwrap();
+    }
+    let project = project.canonicalize().unwrap();
+    std::fs::write(project.join("CLAUDE.md"), "initial project instruction\n").unwrap();
+    let target = project.join(edited);
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, "{}\n").unwrap();
+    let command = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/two-roles/bin/claude")
+        .canonicalize()
+        .unwrap();
+    let settings = owned_settings(&fixture, &project, &work, &home, true, false);
+    let (mut running, _) = start_review_daemon(&settings, command, true, false);
+    let agent = hire_shared_peers(&running, &project);
+    let mut socket = Client::connect(settings.socket()).unwrap();
+    let credential = || {
+        OperatorCredential::new(
+            std::fs::read_to_string(
+                settings
+                    .runtime_dir
+                    .join(dudes_rpc::OPERATOR_CREDENTIAL_NAME),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    };
+    let mut call = |method, params| {
+        socket
+            .call_as_operator(method, Some(params), credential())
+            .unwrap()
+    };
+    let (card, turn) = start_ticket(&fixture, &mut call, agent);
+    let started_lsn = assert_sampled_start(&fixture, turn, &target);
+    std::fs::write(&target, "{\"changed\":true}\n").unwrap();
+    std::fs::write(work.join("release.1"), "").unwrap();
+    assert_finished_boundary(&fixture, turn, started_lsn);
+    let read = await_review(&fixture, &mut call, card, agent, true, false, None);
+    assert_eq!(
+        read.ticket.reason,
+        Some(TicketReason::SharedInstructionsChanged)
+    );
+    let review = read.ticket.instruction_review.as_ref().unwrap();
+    assert!(
+        review
+            .changed_paths
+            .iter()
+            .any(|path| path.path.to_path().ok().as_deref() == Some(target.as_path()))
+    );
+    drop(socket);
+    running.stop(duded::ExitCause::ShutdownRpc);
+}
+
+#[test]
+fn editing_claudes_project_settings_holds_the_ticket() {
+    settings_edit_in_a_shared_project(".claude/settings.json");
+}
+
+#[test]
+fn editing_claudes_local_project_settings_holds_the_ticket() {
+    settings_edit_in_a_shared_project(".claude/settings.local.json");
 }

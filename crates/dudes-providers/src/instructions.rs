@@ -587,6 +587,16 @@ fn claude_project(
             imports,
         );
     }
+    declaration.input(
+        root.clone(),
+        DiscoveryRule::FixedCandidates {
+            names: names(&[".claude/settings.json", ".claude/settings.local.json"]),
+            selection: CandidateSelection::All,
+        },
+        Activation::Active,
+        evidence,
+        ImportRule::None,
+    );
     for scope in [
         RuleDirectoryScope::Ancestors,
         RuleDirectoryScope::Descendants,
@@ -968,7 +978,7 @@ pub(crate) fn codex_manifest(
     }
     if let Some(path) = declaration.path(ctx.cwd) {
         declaration.input(
-            InstructionRoot::ExecutionDirectory(path),
+            InstructionRoot::ExecutionDirectory(path.clone()),
             DiscoveryRule::AncestorCandidates {
                 names: names(&["AGENTS.override.md", "AGENTS.md"]),
                 selection: CandidateSelection::FirstRegular,
@@ -977,6 +987,19 @@ pub(crate) fn codex_manifest(
                 },
             },
             activation,
+            EvidenceRevision::Codex01601,
+            ImportRule::None,
+        );
+        declaration.input(
+            InstructionRoot::ExecutionDirectory(path),
+            DiscoveryRule::AncestorCandidates {
+                names: names(&[".codex/config.toml"]),
+                selection: CandidateSelection::All,
+                boundary: AncestorBoundary::CodexRootMarkers {
+                    defaults: names(&[".git"]),
+                },
+            },
+            Activation::Active,
             EvidenceRevision::Codex01601,
             ImportRule::None,
         );
@@ -1039,6 +1062,16 @@ pub(crate) fn pi_manifest(ctx: &AgentCtx<'_>) -> InstructionDeclaration {
                 names: candidates,
                 selection: CandidateSelection::FirstReadable,
                 boundary: AncestorBoundary::FilesystemRoot,
+            },
+            Activation::Active,
+            EvidenceRevision::Pi104,
+            ImportRule::None,
+        );
+        declaration.input(
+            root.clone(),
+            DiscoveryRule::FixedCandidates {
+                names: names(&[".pi/settings.json"]),
+                selection: CandidateSelection::All,
             },
             Activation::Active,
             EvidenceRevision::Pi104,
@@ -1539,6 +1572,38 @@ mod tests {
     }
 
     #[test]
+    fn project_engine_settings_files_are_fingerprinted_inputs() {
+        let supplied = [EnvVar::new("HOME", "/home/operator")];
+        let settings = |manifest: &InstructionDeclaration, files: &[&str]| {
+            manifest.inputs.iter().any(|input| {
+                matches!(input.root, InstructionRoot::ExecutionDirectory(_))
+                    && input.activation == Activation::Active
+                    && matches!(&input.rule,
+                        DiscoveryRule::FixedCandidates { names: found, .. }
+                        | DiscoveryRule::AncestorCandidates { names: found, .. }
+                        if found == &names(files))
+            })
+        };
+        let claude = declaration(
+            &ClaudeAdapter::default(),
+            &ctx(&supplied, true),
+            Mode::Managed,
+        );
+        assert!(settings(
+            &claude,
+            &[".claude/settings.json", ".claude/settings.local.json"]
+        ));
+        let codex = declaration(
+            &CodexAdapter::default(),
+            &ctx(&supplied, true),
+            Mode::Managed,
+        );
+        assert!(settings(&codex, &[".codex/config.toml"]));
+        let pi = declaration(&PiAdapter::default(), &ctx(&supplied, true), Mode::Managed);
+        assert!(settings(&pi, &[".pi/settings.json"]));
+    }
+
+    #[test]
     fn pi_retains_all_five_priority_names_and_global_system_candidates() {
         let supplied = [EnvVar::new("PI_CODING_AGENT_DIR", "profiles/pi")];
         let manifest = declaration(&PiAdapter::default(), &ctx(&supplied, true), Mode::Managed);
@@ -1564,14 +1629,14 @@ mod tests {
             }
         );
         assert_eq!(
-            manifest.inputs[3].rule,
+            manifest.inputs[4].rule,
             DiscoveryRule::FixedCandidates {
                 names: names(&[".pi/SYSTEM.md", ".pi/APPEND_SYSTEM.md"]),
                 selection: CandidateSelection::All,
             }
         );
         assert_eq!(
-            manifest.inputs[3].activation,
+            manifest.inputs[4].activation,
             Activation::Inactive(InactiveReason::PiNoApprove)
         );
         assert!(matches!(
@@ -1754,7 +1819,7 @@ mod tests {
         assert!(manifest.gaps.contains(&DeclarationGap::DeclarationLimit));
         assert_eq!(
             manifest.inputs.last().unwrap().root,
-            InstructionRoot::AdditionalDirectory("additional/167".into())
+            InstructionRoot::AdditionalDirectory("additional/166".into())
         );
         assert!(manifest.inputs.iter().any(|input| {
             input.root == InstructionRoot::AdditionalDirectory("additional/0".into())

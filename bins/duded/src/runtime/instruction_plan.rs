@@ -4,11 +4,11 @@ use dudes_proto::instruction::{
     InstructionActivation, InstructionAncestorStop, InstructionCandidate, InstructionCondition,
     InstructionCoverageGap, InstructionDeclarationMode, InstructionDiscoveryEvidence,
     InstructionDiscoveryEvidenceKind, InstructionDiscoveryPlan, InstructionDiscoveryRule,
-    InstructionGapKind, InstructionImportPolicy, InstructionParticipant, InstructionPathContext,
-    InstructionRoot, InstructionRootKind, InstructionRuleDirectoryScope, InstructionSelection,
-    InstructionSharedInput, InstructionValidationError, MAX_CLAUDE_IMPORT_DEPTH,
-    MAX_INSTRUCTION_INPUTS, MAX_INSTRUCTION_METADATA_BYTES, MAX_INSTRUCTION_PATH_BYTES,
-    NativeInstructionPath,
+    InstructionGapKind, InstructionGapOrigin, InstructionImportPolicy, InstructionParticipant,
+    InstructionPathContext, InstructionRoot, InstructionRootKind, InstructionRuleDirectoryScope,
+    InstructionSelection, InstructionSharedInput, InstructionValidationError,
+    MAX_CLAUDE_IMPORT_DEPTH, MAX_INSTRUCTION_INPUTS, MAX_INSTRUCTION_METADATA_BYTES,
+    MAX_INSTRUCTION_PATH_BYTES, NativeInstructionPath,
 };
 use dudes_proto::record::Hex32;
 use dudes_providers::instructions::{
@@ -114,9 +114,10 @@ pub(super) fn instruction_participant(
         digest.text("configuration-unknown");
     }
     if declaration.mode == DeclarationMode::PiManaged {
-        builder.gap(
+        builder.gap_from(
             InstructionGapKind::PathUnresolved,
             InstructionPathContext::Unresolved,
+            InstructionGapOrigin::Declared,
         );
         if facts
             .canonical_execution_folder
@@ -129,9 +130,10 @@ pub(super) fn instruction_participant(
         {
             gap.path = Some(path);
         }
-        builder.gap(
+        builder.gap_from(
             InstructionGapKind::ConfigurationUnknown,
             shared(InstructionSharedInput::ExplicitFile),
+            InstructionGapOrigin::Declared,
         );
     }
     digest.path(facts.canonical_execution_folder);
@@ -146,7 +148,7 @@ pub(super) fn instruction_participant(
     for gap in declaration.gaps.iter().take(MAX_INSTRUCTION_INPUTS) {
         digest.text(&format!("{gap:?}"));
         if !discharged(*gap, declaration.mode, facts.codex_guard) {
-            builder.gap(map_gap(*gap), gap_context(*gap));
+            builder.gap_from(map_gap(*gap), gap_context(*gap), gap_origin(*gap));
         }
     }
     if declaration.gaps.len() > MAX_INSTRUCTION_INPUTS
@@ -381,7 +383,17 @@ impl PlanBuilder {
     }
 
     fn gap(&mut self, reason: InstructionGapKind, context: InstructionPathContext) {
+        self.gap_from(reason, context, InstructionGapOrigin::Observed);
+    }
+
+    fn gap_from(
+        &mut self,
+        reason: InstructionGapKind,
+        context: InstructionPathContext,
+        origin: InstructionGapOrigin,
+    ) {
         let gap = InstructionCoverageGap {
+            origin,
             reason,
             context,
             agent: Some(self.agent),
@@ -694,7 +706,11 @@ fn input_candidate(
         }
         DiscoveryRule::GeneratedConfig { .. } => {
             if facts.daemon_configuration_digest.is_none() {
-                builder.gap(InstructionGapKind::ConfigurationUnknown, context);
+                builder.gap_from(
+                    InstructionGapKind::ConfigurationUnknown,
+                    context,
+                    InstructionGapOrigin::Declared,
+                );
             }
             return None;
         }
@@ -800,6 +816,24 @@ fn gap_context(gap: DeclarationGap) -> InstructionPathContext {
             shared(InstructionSharedInput::ExplicitFile)
         }
         _ => InstructionPathContext::Unresolved,
+    }
+}
+
+/// Only the inputs an engine reads from outside the project, which Dudes can never observe, are
+/// standing limits. Every other declaration gap, and every gap added to the declaration later,
+/// is observed until it is listed here.
+fn gap_origin(gap: DeclarationGap) -> InstructionGapOrigin {
+    match gap {
+        DeclarationGap::CodexFallbackNames
+        | DeclarationGap::CodexRootMarkers
+        | DeclarationGap::CodexModelInstructionsFile
+        | DeclarationGap::CodexEffectiveConfiguration
+        | DeclarationGap::CodexEffectiveTrust
+        | DeclarationGap::PiEffectiveConfiguration
+        | DeclarationGap::ClaudeEffectiveConfiguration
+        | DeclarationGap::ClaudeAgentsPlugin
+        | DeclarationGap::ClaudeManagedInlinePolicy => InstructionGapOrigin::Declared,
+        _ => InstructionGapOrigin::Observed,
     }
 }
 
@@ -1161,6 +1195,185 @@ mod tests {
                     && gap.context == shared(InstructionSharedInput::ExplicitFile))
         );
         assert_eq!(mapped.discovery.validate(), Ok(()));
+    }
+
+    fn engine_participant(
+        adapter: &dyn dudes_providers::adapter::Adapter,
+        folder: &Path,
+    ) -> InstructionParticipant {
+        use dudes_providers::adapter::AgentCtx;
+        use dudes_types::{Mode, ModelSelection};
+        let env = [dudes_providers::launch::EnvVar::new(
+            "HOME",
+            "/home/operator",
+        )];
+        let ctx = AgentCtx {
+            agent: agent(),
+            cwd: folder,
+            agent_dir: Path::new("/state/agents/owner"),
+            daemon_env: &env,
+            sandbox: None,
+            trusted: true,
+            max_turns: None,
+            max_budget: None,
+            mcp_servers: &[],
+        };
+        let declaration =
+            adapter.instruction_manifest(&ctx, Mode::Managed, &ModelSelection::provider_default());
+        let evidence = evidence();
+        let mut facts = facts(&evidence);
+        facts.canonical_execution_folder = folder;
+        facts.project_context = ProjectInstructionContext::Shared;
+        facts.daemon_configuration_digest = None;
+        instruction_participant(agent(), adapter.provider(), &declaration, &facts)
+    }
+
+    #[test]
+    fn every_gap_a_stock_engine_declaration_carries_is_a_standing_limit() {
+        use dudes_providers::{
+            claude::ClaudeAdapter, claude::config::ClaudeConfig, codex::CodexAdapter,
+            codex::config::CodexConfig, pi::PiAdapter,
+        };
+        let streaming = CodexConfig {
+            streaming: true,
+            ..CodexConfig::default()
+        };
+        let adapters: [Box<dyn dudes_providers::adapter::Adapter>; 4] = [
+            Box::new(ClaudeAdapter::new(ClaudeConfig::default())),
+            Box::new(CodexAdapter::new(CodexConfig::default())),
+            Box::new(CodexAdapter::new(streaming).with_managed_home("/state/codex-home".into())),
+            Box::new(PiAdapter::default()),
+        ];
+        for adapter in adapters {
+            let participant = engine_participant(adapter.as_ref(), Path::new(FOLDER));
+            let comparison = dudes_proto::instruction::InstructionComparison {
+                changes: Vec::new(),
+                gaps: participant.discovery.gaps.clone(),
+                usage: dudes_proto::InstructionSampleUsage::default(),
+            };
+            let holding: Vec<_> = comparison.gaps.iter().filter(|gap| gap.holds()).collect();
+            assert!(
+                holding.is_empty(),
+                "{:?} declaration leaves gaps that hold: {holding:?}",
+                adapter.provider()
+            );
+            assert!(!comparison.has_shared_gaps());
+            let note = dudes_proto::TicketCoverageNote::from_comparison(
+                &comparison,
+                Some(adapter.provider()),
+            )
+            .expect("a stock declaration always carries standing limits");
+            assert!(note.saw_no_change);
+        }
+    }
+
+    #[test]
+    fn editing_a_project_settings_file_in_a_shared_project_is_a_known_shared_change() {
+        use dudes_providers::{
+            claude::ClaudeAdapter, claude::config::ClaudeConfig, codex::CodexAdapter,
+            codex::config::CodexConfig, pi::PiAdapter,
+        };
+        let cases: [(Box<dyn dudes_providers::adapter::Adapter>, &str); 4] = [
+            (
+                Box::new(ClaudeAdapter::new(ClaudeConfig::default())),
+                ".claude/settings.json",
+            ),
+            (
+                Box::new(ClaudeAdapter::new(ClaudeConfig::default())),
+                ".claude/settings.local.json",
+            ),
+            (
+                Box::new(CodexAdapter::new(CodexConfig::default())),
+                ".codex/config.toml",
+            ),
+            (Box::new(PiAdapter::default()), ".pi/settings.json"),
+        ];
+        for (adapter, file) in cases {
+            let directory = tempfile::tempdir().unwrap();
+            let folder = std::fs::canonicalize(directory.path()).unwrap();
+            std::fs::create_dir(folder.join(".git")).unwrap();
+            let target = folder.join(file);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(&target, "one").unwrap();
+            let participant = engine_participant(adapter.as_ref(), &folder);
+            let snapshot = dudes_proto::instruction::InstructionSnapshot {
+                sampled_at: dudes_types::Timestamp::UNIX_EPOCH,
+                source: dudes_proto::instruction::InstructionSnapshotSource::Fresh,
+                boot: None,
+                execution_folder: Some(NativeInstructionPath::from_path(&folder).unwrap()),
+                participants: vec![participant],
+                inputs: Vec::new(),
+                inventoried: Vec::new(),
+                gaps: Vec::new(),
+                usage: dudes_proto::InstructionSampleUsage::default(),
+            };
+            let before = crate::instruction_sample::observe(snapshot.clone());
+            std::fs::write(&target, "two").unwrap();
+            let after = crate::instruction_sample::observe(snapshot);
+            let comparison = crate::instruction_sample::compare(&before, &after);
+            assert!(
+                comparison.has_shared_changes()
+                    && comparison.changes.iter().any(|change| change
+                        .path
+                        .to_path()
+                        .ok()
+                        .as_deref()
+                        == Some(target.as_path())),
+                "{file}: {:?}",
+                comparison.changes
+            );
+        }
+    }
+
+    #[test]
+    fn a_declared_gap_never_absorbs_an_observed_gap_that_differs_only_in_origin() {
+        let mut builder = PlanBuilder::new(agent(), None);
+        let context = shared(InstructionSharedInput::Profile);
+        builder.gap_from(
+            InstructionGapKind::ConfigurationUnknown,
+            context,
+            InstructionGapOrigin::Declared,
+        );
+        builder.gap(InstructionGapKind::ConfigurationUnknown, context);
+        let held: Vec<_> = builder
+            .finish()
+            .gaps
+            .into_iter()
+            .filter(|gap| gap.reason == InstructionGapKind::ConfigurationUnknown)
+            .map(|gap| gap.origin)
+            .collect();
+        assert_eq!(
+            held,
+            [
+                InstructionGapOrigin::Declared,
+                InstructionGapOrigin::Observed
+            ]
+        );
+    }
+
+    #[test]
+    fn only_inputs_the_engine_reads_outside_the_project_are_declared() {
+        use dudes_providers::instructions::{ExplicitFilePurpose, ProfileKind, ResourceKind};
+        let observed = [
+            DeclarationGap::DeclarationMissing,
+            DeclarationGap::DeclarationLimit,
+            DeclarationGap::MetadataLimit,
+            DeclarationGap::PathUnresolved,
+            DeclarationGap::ProfileUnavailable(ProfileKind::CodexLegacy),
+            DeclarationGap::ClaudeSettingSourcesRefused,
+            DeclarationGap::ClaudeImportApproval,
+            DeclarationGap::ClaudeImportHomeUnavailable,
+            DeclarationGap::ClaudeAdditionalDirectoriesSwitch,
+            DeclarationGap::ClaudeInlinePrompt,
+            DeclarationGap::ClaudeInlineAgentDefinitions,
+            DeclarationGap::ExplicitResourceUnknown(ResourceKind::ClaudePlugin),
+            DeclarationGap::ExplicitFileValueMissing(ExplicitFilePurpose::SystemPrompt),
+            DeclarationGap::ExplicitDirectoryValueMissing,
+            DeclarationGap::ArgumentEncoding,
+        ];
+        for gap in observed {
+            assert_eq!(gap_origin(gap), InstructionGapOrigin::Observed, "{gap:?}");
+        }
     }
 
     #[test]

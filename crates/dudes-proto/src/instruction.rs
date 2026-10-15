@@ -592,6 +592,20 @@ pub enum InstructionGapKind {
     EndingBoundaryMissing,
 }
 
+/// Where a coverage gap came from. It is part of a gap's identity, so a declared gap never
+/// absorbs an observed one that is otherwise equal.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InstructionGapOrigin {
+    /// A standing limit of the engine itself: an input the engine reads that Dudes can never see.
+    /// It annotates a passing ticket and does not hold it.
+    Declared,
+    /// Raised by sampling or comparing this run. A record without an origin reads as this, so an
+    /// older record keeps holding.
+    #[default]
+    Observed,
+}
+
 /// Independent uncertainty, scoped separately from any known path changes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct InstructionCoverageGap {
@@ -603,6 +617,9 @@ pub struct InstructionCoverageGap {
     pub agent: Option<AgentId>,
     /// The affected native path, when representable.
     pub path: Option<NativeInstructionPath>,
+    /// Whether the gap is a standing engine limit or something this run found.
+    #[serde(default)]
+    pub origin: InstructionGapOrigin,
 }
 
 impl InstructionCoverageGap {
@@ -614,7 +631,20 @@ impl InstructionCoverageGap {
             context: InstructionPathContext::Unresolved,
             agent: None,
             path: None,
+            origin: InstructionGapOrigin::Observed,
         }
+    }
+
+    /// Whether this gap alone asks the operator to review shared instructions.
+    #[must_use]
+    pub const fn holds(&self) -> bool {
+        matches!(self.origin, InstructionGapOrigin::Observed) && self.context.needs_shared_review()
+    }
+
+    /// Whether this is a standing engine limit in a context that needs shared review.
+    #[must_use]
+    pub const fn is_standing_limit(&self) -> bool {
+        matches!(self.origin, InstructionGapOrigin::Declared) && self.context.needs_shared_review()
     }
 }
 
@@ -1103,6 +1133,113 @@ pub struct InstructionPendingReview {
     pub gaps: Vec<InstructionCoverageGap>,
 }
 
+/// What Dudes could not see during a ticket that passed without a seen change. It lists the
+/// standing engine limits only; it is not an instruction review and holds nothing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TicketCoverageNote {
+    /// The engine whose limits these are, when the recorded baseline names it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<Provider>,
+    /// The standing limits, each kind once.
+    pub limits: Vec<InstructionGapKind>,
+    /// Dudes saw no change and met no limit of its own while comparing the files it can read.
+    pub saw_no_change: bool,
+}
+
+impl TicketCoverageNote {
+    /// Build the note for one finished comparison, or none when it has no standing limit.
+    #[must_use]
+    pub fn from_comparison(
+        comparison: &InstructionComparison,
+        provider: Option<Provider>,
+    ) -> Option<Self> {
+        let mut limits = Vec::new();
+        for gap in comparison.gaps.iter().filter(|gap| gap.is_standing_limit()) {
+            if !limits.contains(&gap.reason) {
+                limits.push(gap.reason);
+            }
+        }
+        (!limits.is_empty()).then(|| Self {
+            provider,
+            limits,
+            saw_no_change: comparison.changes.is_empty()
+                && comparison
+                    .gaps
+                    .iter()
+                    .all(|gap| gap.origin == InstructionGapOrigin::Declared),
+        })
+    }
+
+    /// The note in plain words for the operator, without a trailing newline.
+    #[must_use]
+    pub fn sentence(&self) -> String {
+        let engine = match self.provider {
+            Some(Provider::Codex) => "Codex",
+            Some(Provider::Claude) => "Claude",
+            Some(Provider::Pi) => "Pi",
+            _ => "the engine",
+        };
+        let mut phrases: Vec<&str> = Vec::new();
+        for limit in &self.limits {
+            let phrase = match limit {
+                InstructionGapKind::ConfigurationUnknown => "settings in its home folder",
+                InstructionGapKind::FallbackUnknown => "fallback file names",
+                InstructionGapKind::RootMarkerUnknown => "root markers",
+                InstructionGapKind::PluginUnknown => "plugins",
+                InstructionGapKind::PolicyUnknown => "managed policy",
+                InstructionGapKind::PathUnresolved => "project folder lookup",
+                _ => "other inputs",
+            };
+            if !phrases.contains(&phrase) {
+                phrases.push(phrase);
+            }
+        }
+        let list = match phrases.split_last() {
+            Some((only, [])) => (*only).to_owned(),
+            Some((end, rest)) => format!("{} or {end}", rest.join(", ")),
+            None => "own inputs".to_owned(),
+        };
+        let mut sentence = format!("Dudes cannot see {engine}'s {list}.");
+        if self.saw_no_change {
+            sentence
+                .push_str(" It saw no change to the instruction and settings files it can read.");
+        }
+        sentence
+    }
+
+    /// The note for an interval that holds: its own limits, and no claim that nothing changed.
+    #[must_use]
+    pub fn withdrawn(note: Option<Self>, provider: Option<Provider>) -> Self {
+        let mut note = note.unwrap_or(Self {
+            provider,
+            limits: Vec::new(),
+            saw_no_change: false,
+        });
+        note.saw_no_change = false;
+        note
+    }
+
+    /// Fold an interval's note into a ticket's slot. A held interval's note is kept even with no
+    /// limits, so a later clean interval cannot restore the claim of no change.
+    pub fn absorb(slot: &mut Option<Self>, note: Self) {
+        match slot {
+            Some(held) => held.merge(note),
+            None => *slot = Some(note),
+        }
+    }
+
+    /// Fold a later interval of the same ticket into this note.
+    pub fn merge(&mut self, other: Self) {
+        self.provider = other.provider.or(self.provider);
+        for limit in other.limits {
+            if !self.limits.contains(&limit) {
+                self.limits.push(limit);
+            }
+        }
+        self.saw_no_change &= other.saw_no_change;
+    }
+}
+
 /// Small action/evidence summary carried by the Floor card snapshot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct InstructionReviewSummary {
@@ -1547,12 +1684,11 @@ impl InstructionComparison {
             .any(|change| change.context.needs_shared_review())
     }
 
-    /// Whether uncertain shared input coverage requires operator review.
+    /// Whether uncertain shared input coverage requires operator review. A standing engine
+    /// limit does not.
     #[must_use]
     pub fn has_shared_gaps(&self) -> bool {
-        self.gaps
-            .iter()
-            .any(|gap| gap.context.needs_shared_review())
+        self.gaps.iter().any(InstructionCoverageGap::holds)
     }
 
     /// Keep the existing known changes when another change cannot fit; add an unknown marker.
@@ -1951,6 +2087,7 @@ mod tests {
 
     fn gap(reason: InstructionGapKind) -> InstructionCoverageGap {
         InstructionCoverageGap {
+            origin: crate::instruction::InstructionGapOrigin::Observed,
             reason,
             context: InstructionPathContext::SharedProject,
             agent: Some(samples::agent()),
@@ -2549,6 +2686,7 @@ mod tests {
         local.context = owned;
         assert!(comparison.try_push_change(local));
         comparison.gaps.push(InstructionCoverageGap {
+            origin: crate::instruction::InstructionGapOrigin::Observed,
             reason: InstructionGapKind::ReadFailed,
             context: owned,
             agent: None,
@@ -2557,6 +2695,7 @@ mod tests {
         assert!(!comparison.has_shared_changes());
         assert!(!comparison.has_shared_gaps());
         comparison.gaps.push(InstructionCoverageGap {
+            origin: crate::instruction::InstructionGapOrigin::Observed,
             reason: InstructionGapKind::ProfileUnknown,
             context: InstructionPathContext::SharedInput {
                 source: InstructionSharedInput::Profile,

@@ -571,6 +571,7 @@ fn read_value(read: &TicketReadResult) -> Value {
         summary,
         check,
         instruction_review,
+        coverage,
         ..
     } = ticket;
     let mut body = json!({
@@ -596,6 +597,9 @@ fn read_value(read: &TicketReadResult) -> Value {
     });
     if let Some(review) = instruction_review {
         body["ticket"]["instruction_review"] = instruction_review_value(review);
+    }
+    if let Some(coverage) = coverage {
+        body["ticket"]["coverage"] = json!(coverage);
     }
     body
 }
@@ -892,6 +896,7 @@ mod tests {
             ],
             gaps: vec![
                 InstructionCoverageGap {
+                    origin: dudes_proto::InstructionGapOrigin::Observed,
                     reason: InstructionGapKind::ReadFailed,
                     context: InstructionPathContext::SharedProject,
                     agent: Some(agent),
@@ -931,6 +936,7 @@ mod tests {
                 summary: Some("s".repeat(4_096)),
                 check: None,
                 instruction_review: Some(review),
+                coverage: None,
             },
             position: None,
             waiting: None,
