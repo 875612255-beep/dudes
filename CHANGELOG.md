@@ -11,6 +11,10 @@ refuses a tag whose version has no section here, and builds the GitHub Release b
 
 ## [Unreleased]
 
+### Fixed
+
+- Recognize native Linux ZFS and OverlayFS, including Docker filesystems, when sampling instruction files. Direct NFS, CIFS and SMB mounts remain refused. FUSE and unknown filesystem types also remain refused. OverlayFS may hide network-backed layers, whose locality and freshness Dudes does not establish.
+
 ## [0.87.0] - 2026-10-14
 
 ### Highlights
