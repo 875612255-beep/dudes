@@ -1675,7 +1675,11 @@ fn a_ticket_start_and_a_goal_set_replay_to_the_same_world() {
                 )
             })
             .collect();
-        worlds.push((flow.agent(agent), who, goal_id, task, common_board));
+        // A ticket start also takes a baseline before its first turn, so the fixture clock has
+        // ticked further by the time the turn starts; the sample time is the only difference.
+        let mut agent_view = flow.agent(agent);
+        agent_view.live_activity = None;
+        worlds.push((agent_view, who, goal_id, task, common_board));
         flow.stop();
     }
     assert_eq!(worlds[0], worlds[1]);
@@ -1788,6 +1792,124 @@ fn a_crash_between_the_start_and_the_turn_issues_one_turn() {
                 .filter(|r| matches!(r, Record::TurnIssued { .. }))
                 .count();
             assert_eq!(issued, 1, "one turn, no duplicate");
+            assert_eq!(review_count(records, RecordKind::TicketBaselineRecorded), 1);
+        },
+    );
+}
+
+fn review_count(records: &[Record], kind: RecordKind) -> usize {
+    records.iter().filter(|r| r.kind() == kind).count()
+}
+
+fn lsn_of_first(
+    entries: &[(dudes_types::Lsn, dudes_proto::Entry)],
+    kind: RecordKind,
+) -> dudes_types::Lsn {
+    entries
+        .iter()
+        .find_map(|(lsn, entry)| (entry.record.kind() == kind).then_some(*lsn))
+        .unwrap_or_else(|| panic!("no {kind:?} was journaled"))
+}
+
+/// The baseline is journaled between the start and the first turn, and names the exact round.
+#[test]
+fn a_started_ticket_records_its_baseline_before_its_first_turn() {
+    let fixture = Fixture::new();
+    let (settings, repo) = enrolled(&fixture);
+    let mut flow = Flow::boot(&fixture, settings, repo, [common::fails()]);
+    let agent = flow.hire("Cody");
+    let card = flow.create("Fix the parser");
+    flow.give_ok(card, agent, None);
+    let (_, _, goal, _) = Flow::await_turn_number(&fixture, 1);
+
+    let entries = fixture.entries();
+    let started = lsn_of_first(&entries, RecordKind::TicketStarted);
+    let baseline_lsn = lsn_of_first(&entries, RecordKind::TicketBaselineRecorded);
+    let issued = lsn_of_first(&entries, RecordKind::TurnIssued);
+    assert!(started < baseline_lsn && baseline_lsn < issued);
+
+    let Some(Record::TicketBaselineRecorded {
+        card: recorded_card,
+        goal: recorded_goal,
+        baseline,
+    }) = entries
+        .iter()
+        .map(|(_, entry)| entry.record.clone())
+        .find(|record| record.kind() == RecordKind::TicketBaselineRecorded)
+    else {
+        panic!("the baseline was journaled")
+    };
+    assert_eq!((recorded_card, recorded_goal), (card, goal));
+    assert_eq!(
+        baseline.binding,
+        dudes_proto::diff_stamp::TicketBinding {
+            card,
+            round: 1,
+            goal,
+            claimant: agent,
+        }
+    );
+    assert_eq!(
+        baseline.versions.sampler,
+        duded::git_read::diff::SAMPLER_VERSION
+    );
+    assert_eq!(
+        baseline.outcome,
+        dudes_proto::diff_stamp::BaselineOutcome::Unavailable {
+            reason: dudes_proto::DiffRefusal::Unreadable
+        }
+    );
+    flow.stop();
+}
+
+/// A check's result is followed by its stamp before the loop issues the next turn.
+#[test]
+fn a_checks_stamp_names_the_result_and_the_baseline_and_precedes_the_next_turn() {
+    let fixture = Fixture::new();
+    let (settings, repo) = enrolled(&fixture);
+    let mut flow = Flow::boot(&fixture, settings, repo, [common::fails()]);
+    let agent = flow.hire("Cody");
+    let card = flow.create("Fix the parser");
+    flow.give_ok(card, agent, None);
+    let (first, ..) = Flow::await_turn_number(&fixture, 1);
+    flow.end_turn(&fixture, first, None);
+    Flow::await_turn_number(&fixture, 2);
+
+    let entries = fixture.entries();
+    let baseline_lsn = lsn_of_first(&entries, RecordKind::TicketBaselineRecorded);
+    let result_lsn = lsn_of_first(&entries, RecordKind::PredicateResult);
+    let stamp_lsn = lsn_of_first(&entries, RecordKind::TicketReviewStamped);
+    let second_issue = entries
+        .iter()
+        .filter(|(_, entry)| entry.record.kind() == RecordKind::TurnIssued)
+        .map(|(lsn, _)| *lsn)
+        .nth(1)
+        .expect("a second turn was issued");
+    assert!(result_lsn < stamp_lsn && stamp_lsn < second_issue);
+
+    let Some(Record::TicketReviewStamped { stamp, .. }) = entries
+        .iter()
+        .map(|(_, entry)| entry.record.clone())
+        .find(|record| record.kind() == RecordKind::TicketReviewStamped)
+    else {
+        panic!("the stamp was journaled")
+    };
+    assert_eq!(
+        (stamp.baseline_lsn, stamp.check_lsn, stamp.binding.round),
+        (baseline_lsn, result_lsn, 1)
+    );
+    flow.stop();
+}
+
+/// Crash while the baseline append fails: the restart owes exactly one baseline, then one turn.
+#[test]
+fn a_crash_at_the_baseline_append_records_it_once_and_issues_one_turn() {
+    crash_and_restart(
+        |r| matches!(r, Record::TicketBaselineRecorded { .. }),
+        |records| {
+            assert_eq!(started_goals(records).len(), 1, "one start");
+            assert_eq!(review_count(records, RecordKind::TicketBaselineRecorded), 1);
+            assert_eq!(review_count(records, RecordKind::TurnIssued), 1);
         },
     );
 }
