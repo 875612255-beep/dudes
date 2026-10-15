@@ -63,6 +63,9 @@ export interface InstructionGap {
   readonly path: InstructionPath | null;
   readonly display: string | null;
   readonly display_truncated: boolean;
+  /** Whether the daemon counts this gap as holding the ticket: observed, in a context that needs shared review. */
+  readonly holds: boolean;
+  readonly origin: 'observed' | 'declared';
 }
 
 export interface InstructionReview {
@@ -176,13 +179,14 @@ export function decodeInstructionReview(value: unknown): InstructionReview | nul
   }
   const gaps: InstructionGap[] = [];
   for (const row of value.gaps) {
-    if (!object(row) || !(INSTRUCTION_GAPS as readonly unknown[]).includes(row.reason) || !nullableId(row.agent) || typeof row.display_truncated !== 'boolean') return null;
+    if (!object(row) || !(INSTRUCTION_GAPS as readonly unknown[]).includes(row.reason) || !nullableId(row.agent) || typeof row.display_truncated !== 'boolean'
+      || typeof row.holds !== 'boolean' || (row.origin !== 'observed' && row.origin !== 'declared')) return null;
     const scope = context(row.context);
     const native = row.path === null ? null : path(row.path);
     if (scope === null || (row.path !== null && (native === null || !display(row.display)))
       || (row.path === null && row.display !== null)) return null;
     gaps.push(Object.freeze({ reason: row.reason as InstructionGapReason, context: scope, agent: row.agent,
-      path: native, display: row.display as string | null, display_truncated: row.display_truncated }));
+      path: native, display: row.display as string | null, display_truncated: row.display_truncated, holds: row.holds, origin: row.origin }));
   }
   return Object.freeze({ watermark, pending_comparison: value.pending_comparison,
     intervals: Object.freeze(intervals as InstructionInterval[]), changed_paths: Object.freeze(paths), gaps: Object.freeze(gaps) });
@@ -196,6 +200,72 @@ export function instructionContextText(scope: InstructionContext): string {
     case 'shared_input': return `Shared ${scope.source.replaceAll('_', ' ')}`;
     case 'unresolved': return 'Unresolved context';
   }
+}
+
+const GAP_SENTENCES: Readonly<Record<InstructionGapReason, string>> = Object.freeze({
+  configuration_unknown: "An agent's engine settings changed during the ticket, or Dudes could not check them.",
+  plugin_unknown: 'Dudes could not tell what a plugin given to the engine adds.',
+  policy_unknown: "Dudes could not check the engine's managed policy.",
+  root_marker_unknown: 'Dudes could not check which root markers the engine used.',
+  fallback_unknown: 'Dudes could not check which fallback file names the engine used.',
+  profile_unknown: "Dudes could not look up the engine's profile settings.",
+  declaration_missing: 'Dudes found no instruction file it knows how to read for this engine.',
+  path_unresolved: 'Dudes could not look up the project folder or a path it needed.',
+  read_failed: 'Dudes could not read an instruction file.',
+  changed_during_read: 'A file changed while Dudes was reading it.',
+  import_unresolved: 'Dudes could not find a file that an instruction file imports.',
+  import_cycle: 'Instruction files import each other in a loop, so Dudes stopped following them.',
+  participant_changed: 'An agent started or stopped working in this folder during the ticket, so Dudes cannot tell who changed what.',
+  declaration_changed: 'The instruction files an agent reads changed during the ticket.',
+  uninventoried_member: 'An instruction file is new and Dudes has no earlier copy to compare it with.',
+  input_limit: 'Dudes stopped sampling at its file limit.',
+  participant_coverage_unknown: 'Another agent was working in this folder, so Dudes cannot tell who changed what.',
+  participant_limit: 'More agents share this folder than Dudes checks, so some were not checked.',
+  ancestor_limit: 'Dudes stopped looking through parent folders at its limit.',
+  descendant_limit: 'Dudes stopped looking through subfolders at its limit.',
+  import_limit: 'Dudes stopped following imports at its limit.',
+  symlink_limit: 'Dudes stopped following links at its limit.',
+  source_bytes_limit: 'Dudes stopped reading at its size limit for instruction files.',
+  deadline: 'Dudes ran out of time while sampling.',
+  metadata_limit: 'There were too many findings to keep, so this list is incomplete.',
+  missing_baseline: 'Dudes has no copy of the instructions from when this work started, so it cannot compare.',
+  unrecorded_launch_boundary: 'Dudes cannot tell whether the agent started before the starting copy was recorded.',
+  cleanup_unconfirmed: "Dudes could not confirm that the agent's process had fully stopped.",
+  attached_turn_start_missing: 'Dudes did not see this attached turn begin.',
+  ending_boundary_missing: "Dudes did not see the agent's process end after the daemon restarted.",
+});
+
+const GAP_WITH_PATH: Partial<Record<InstructionGapReason, (path: string) => string>> = {
+  path_unresolved: (path) => `Dudes could not look up ${path}.`,
+  read_failed: (path) => `Dudes could not read ${path}.`,
+  changed_during_read: (path) => `${path} changed while Dudes was reading it.`,
+  import_unresolved: (path) => `Dudes could not find a file that ${path} imports.`,
+  uninventoried_member: (path) => `${path} is new and Dudes has no earlier copy to compare it with.`,
+};
+
+/** One plain sentence for a gap that holds a ticket, which is always one this run found. It names its path when the gap carries one. */
+export function gapSentence(gap: InstructionGap): string {
+  const shown = gap.display === null ? null : `${gap.display}${gap.display_truncated ? ' [display truncated]' : ''}`;
+  const withPath = GAP_WITH_PATH[gap.reason];
+  return shown !== null && withPath !== undefined ? withPath(shown) : GAP_SENTENCES[gap.reason];
+}
+
+export interface GapGroup {
+  readonly sentence: string;
+  /** Agents the gap names that were not working on this ticket. */
+  readonly others: readonly string[];
+}
+
+/** Holding gaps that say the same thing become one line. Only an agent outside the ticket's own intervals is named. */
+export function groupGaps(review: InstructionReview): readonly GapGroup[] {
+  const working = new Set(review.intervals.map((row) => row.agent));
+  const groups = new Map<string, string[]>();
+  for (const gap of review.gaps.filter((row) => row.holds)) {
+    const others = groups.get(gapSentence(gap)) ?? [];
+    if (gap.agent !== null && !working.has(gap.agent) && !others.includes(gap.agent)) others.push(gap.agent);
+    groups.set(gapSentence(gap), others);
+  }
+  return [...groups].map(([sentence, others]) => Object.freeze({ sentence, others: Object.freeze(others) }));
 }
 
 const COVERAGE_ENGINES = Object.freeze({ codex: 'Codex', claude: 'Claude', pi: 'Pi' } as const);
