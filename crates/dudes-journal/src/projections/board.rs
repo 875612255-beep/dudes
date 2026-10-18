@@ -13,6 +13,8 @@ use crate::error::Result;
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct BoardRow {
+    #[serde(default)]
+    pub(super) recovery_change_lsn: Lsn,
     #[serde(flatten)]
     pub(super) view: CardView,
     #[serde(default)]
@@ -55,6 +57,7 @@ pub(super) fn apply(
             table,
             &card.to_bytes(),
             &BoardRow {
+                recovery_change_lsn: lsn,
                 view: CardView {
                     id: *card,
                     title: title.clone(),
@@ -226,6 +229,7 @@ fn apply_ticket(table: &mut RowTable<'_>, lsn: Lsn, record: &Record) -> Result<(
                 coverage: None,
             };
             let row = BoardRow {
+                recovery_change_lsn: lsn,
                 view,
                 claimed_lsn: None,
                 ticket: Some(ticket),
@@ -262,6 +266,28 @@ fn apply_ticket(table: &mut RowTable<'_>, lsn: Lsn, record: &Record) -> Result<(
         Record::TicketRemoved { card, .. } => remove_ticket(table, lsn, *card),
         _ => Ok(()),
     }
+}
+
+pub(super) fn capture_recovery_change(
+    table: &mut RowTable<'_>,
+    lsn: Lsn,
+    entry: &Entry,
+) -> Result<()> {
+    let card = match &entry.record {
+        Record::CardCreated { card, .. }
+        | Record::CardTransition { card, .. }
+        | Record::Claim { card, .. }
+        | Record::TicketCreated { card, .. }
+        | Record::TicketAssigned { card, .. }
+        | Record::TicketStarted { card, .. }
+        | Record::TicketRemoved { card, .. } => *card,
+        _ => return Ok(()),
+    };
+    if let Some(mut row) = get_row::<BoardRow>(table, &card.to_bytes())? {
+        row.recovery_change_lsn = lsn;
+        put_row(table, &card.to_bytes(), &row)?;
+    }
+    Ok(())
 }
 
 pub(super) fn apply_instruction(
@@ -328,7 +354,9 @@ pub(super) fn apply_instruction(
             }
             ticket.instruction_review = review;
             if let Some(reason) = reason {
-                ticket.reason = Some(reason);
+                if ticket.reason != Some(dudes_proto::TicketReason::RecoveryRequired) {
+                    ticket.reason = Some(reason);
+                }
                 row.view.status = CardStatus::Blocked;
                 row.view.status_by = Actor::System;
             }
@@ -363,11 +391,21 @@ fn review_ticket(
             row.view.seq = expected_seq.next();
             row.view.status_by = by;
             let ticket = row.ticket.as_mut().expect("ticket was checked");
-            ticket.reason = None;
+            let recovery_wait = ticket.reason == Some(dudes_proto::TicketReason::RecoveryRequired);
+            if !recovery_wait
+                || matches!(
+                    completion,
+                    dudes_proto::InstructionAcceptCompletion::Completed { .. }
+                )
+            {
+                ticket.reason = None;
+            }
             row.view.status = match completion {
                 dudes_proto::InstructionAcceptCompletion::Completed { .. } => CardStatus::Done,
                 dudes_proto::InstructionAcceptCompletion::Continue => {
-                    if ticket.queue.is_some() {
+                    if recovery_wait {
+                        CardStatus::Blocked
+                    } else if ticket.queue.is_some() {
                         CardStatus::Claimed
                     } else if ticket.goal.is_some() && row.view.claimed_by.is_some() {
                         CardStatus::Doing

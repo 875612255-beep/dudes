@@ -255,6 +255,8 @@ const ADMITTED_IN_ANSWER_FORM = Object.freeze(['a textarea', 'a change handler',
 const CONTROL_PANEL = 'src/renderer/control/ControlPanel.tsx';
 const PAUSE_ALL_PANEL = 'src/renderer/control/PauseAllControl.tsx';
 const CONTROL_MODULE = 'src/renderer/control/control.ts';
+const RECOVERY_PANEL = 'src/renderer/recovery/RecoveryPanel.tsx';
+const RECOVERY_MODULE = 'src/renderer/recovery/recovery.ts';
 const TERMINAL_PANEL = 'src/renderer/terminal/TerminalPanel.tsx';
 const TERMINAL_MODULE = 'src/renderer/terminal/terminal.ts';
 const TERMINAL_CONTROLS = 'src/renderer/terminal/controls.ts';
@@ -263,6 +265,7 @@ const RETIRE_MODULE = 'src/renderer/retire/retire.ts';
 const TICKET_MODULE = 'src/renderer/ticket/ticket.ts';
 const TICKET_BOARD = 'src/renderer/ticket/TicketBoard.tsx';
 const TICKET_PANEL = 'src/renderer/ticket/TicketPanel.tsx';
+const RECOVERED_REVIEW = 'src/renderer/ticket/RecoveredReview.tsx';
 const ADMITTED_IN_TICKET_FORM = Object.freeze(['an input', 'a form', 'a textarea', 'a select', 'a change handler', 'a submit handler']);
 const GIT_MODULE = 'src/renderer/git/git.ts';
 const GIT_PANEL = 'src/renderer/git/GitPanel.tsx';
@@ -298,6 +301,7 @@ const HIRE_ENTRY = 'src/renderer/onboarding/HireEntry.tsx';
 const STREAM_NOTICE = 'src/renderer/StreamNotice.tsx';
 const ADMITTED_WITHOUT_HANDLER = new Map([
   [SETUP_VIEW, Object.freeze(['a link'])], [SETTINGS_VIEW, Object.freeze(['a link'])], [STREAM_NOTICE, Object.freeze(['a link'])],
+  [RECOVERED_REVIEW, Object.freeze(['a link'])],
 ]);
 /**
  * The `FORBIDDEN` kinds each listed file may carry. "the floor ships no
@@ -1050,7 +1054,7 @@ test('the goal form has one text field, named goal, and one check choice, each w
 test('the only activators are named selection, retry, view, Hire, answer, Chat, pause, Pause all, resume, goal change, look edit and dismiss buttons, '
   + 'the office\'s speech marks and its two turn and two zoom buttons, the terminal\'s Attach, Detach, Close, zoom, copy and expand, Retire\'s own four, the Git tab\'s Refresh and Copy path, '
   + 'the Memory tab\'s Refresh, Try again, Load older entries and Read whole entry, Setup\'s Recheck, Copy and guide opener, '
-  + 'Settings\' office layout and desktop notification choices, the guide\'s navigation and Hire opener, '
+  + 'Settings\' office layout and desktop notification choices, recovery inspection, context choices, one authorization and inert receipt lookup, earlier acknowledged-review disclosure, the guide\'s navigation and Hire opener, '
   + 'and checkout differences\' explicit show, refresh, hide, open and more-files controls', async () => {
   const buttons = [];
   const clicks = [];
@@ -1074,6 +1078,7 @@ test('the only activators are named selection, retry, view, Hire, answer, Chat, 
     ...Array(8).fill(CHAT_PANEL),
     ...Array(4).fill(CONTROL_PANEL),
     ...Array(5).fill(PAUSE_ALL_PANEL),
+    ...Array(4).fill(RECOVERY_PANEL),
     ...Array(3).fill(GOAL_PANEL),
     ...Array(2).fill('src/renderer/ticket/TicketBanner.tsx'),
     ...Array(6).fill(TICKET_BOARD),
@@ -1100,8 +1105,45 @@ test('the only activators are named selection, retry, view, Hire, answer, Chat, 
   clickExpected.splice(clickExpected.indexOf(TICKET_BOARD), 1);
   clickExpected.splice(clickExpected.indexOf(TICKET_PANEL), 1);
   clickExpected.splice(clickExpected.indexOf(TICKET_PANEL), 1);
+  clickExpected.push(RECOVERED_REVIEW);
   assert.deepEqual(clicks.sort(), clickExpected.sort());
   const readError = await readFile(resolve(source, 'renderer/ReadError.tsx'), 'utf8');
+  assert.deepEqual(clicksIn(await readFile(resolve(floor, RECOVERY_PANEL), 'utf8')), [
+    '(event) => { if (event.detail < 2) void inspectRecovery(row.id, browserRecoveryDeps); }',
+    '() => { if (problem === null && !blocked) chooseRecovery(draft.key, choice); }',
+    '(event) => { if (event.detail < 2) void submitRecovery(draft.key, browserRecoveryDeps); }',
+    '(event) => { if (event.detail < 2) void checkRecoveryReceipt(id, browserRecoveryDeps); }',
+  ]);
+  const recovered = await readFile(resolve(floor, RECOVERED_REVIEW), 'utf8');
+  const historyClick = `(event) => {
+          event.preventDefault();
+          if (row.acknowledgment.state === 'found') {
+            const section = acknowledged.current.get(row.acknowledgment.lsn);
+            if (section) { section.open = true; section.focus(); }
+          }
+        }`;
+  function expectHistoryLinks(text) {
+    assert.deepEqual(clicksIn(text), [historyClick]);
+    const anchors = [];
+    (function walk(node) {
+      if ((ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) && node.tagName.getText() === 'a') {
+        anchors.push(node.attributes.properties.filter((attribute) => ts.isJsxAttribute(attribute) && attribute.name.getText() === 'href')
+          .map((attribute) => attribute.initializer !== undefined && ts.isStringLiteral(attribute.initializer) ? attribute.initializer.text : null));
+      }
+      ts.forEachChild(node, walk);
+    })(parsedByExtension(text, RECOVERED_REVIEW));
+    assert.deepEqual(anchors, [['#earlier-acknowledged-reviews']]);
+  }
+  expectHistoryLinks(recovered);
+  for (const changed of [
+    recovered.replace('</section>;', '{fresh ? <a href="https://example.invalid">extra</a> : null}</section>;'),
+    recovered.replace('</section>;', '{fresh ? <a href="#extra">extra</a> : null}</section>;'),
+    recovered.replace('</section>;', '{fresh ? <a>extra</a> : null}</section>;'),
+    recovered.replace('href="#earlier-acknowledged-reviews"', 'href="https://example.invalid"'),
+    recovered.replace('href="#earlier-acknowledged-reviews"', 'href="#other-review"'),
+    recovered.replace('href="#earlier-acknowledged-reviews"', 'href={context.binding.card}'),
+  ]) assert.throws(() => expectHistoryLinks(changed));
+  assert.notDeepEqual(clicksIn(recovered.replace('section.open = true', "void fetch('/floor/recovery/submit')")), [historyClick]);
   assert.deepEqual(clicksIn(readError), ['onRetry']);
   assert.match(readError, /onRetry = refreshFloorSnapshot/);
   const archive = await readFile(resolve(floor, ARCHIVED_AGENTS), 'utf8');
@@ -1444,6 +1486,11 @@ const REQUESTS = {
     methods: ['POST'],
     fetches: ['floorFetch', 'fetch', 'floorFetch', 'deps.fetch', 'fetch(ROUTES[attempt.verb])'],
   },
+  [RECOVERY_MODULE]: {
+    paths: ['application/json', '/floor/recovery/inspect', '/floor/recovery/submit', '/floor/recovery/receipt'],
+    methods: ['POST'],
+    fetches: ['floorFetch', 'fetch', 'floorFetch', "deps.fetch('/floor/recovery/inspect')", "deps.fetch('/floor/recovery/submit')", "deps.fetch('/floor/recovery/receipt')"],
+  },
   'src/renderer/control/pauseAll.ts': {
     paths: [],
     methods: [],
@@ -1649,7 +1696,7 @@ test('fetch and new WebSocket match in fifteen known files, and requestsIn yield
     Object.fromEntries([...reaching].sort().map(([name, files]) => [name, [...files].sort()])),
     {
       WebSocket: ['src/renderer/floor/stream.ts'],
-      fetch: [ANSWER_MODULE, CHAT_MODULE, CONTROL_MODULE, DIFF_MODULE, 'src/renderer/floor/away.ts', GIT_MODULE, GOAL_MODULE, LOOK_MODULE, MEMORY_MODULE, 'src/renderer/onboarding/hire.ts', RENAME_MODULE, RETIRE_MODULE,
+      fetch: [ANSWER_MODULE, CHAT_MODULE, CONTROL_MODULE, DIFF_MODULE, 'src/renderer/floor/away.ts', GIT_MODULE, GOAL_MODULE, LOOK_MODULE, MEMORY_MODULE, 'src/renderer/onboarding/hire.ts', RECOVERY_MODULE, RENAME_MODULE, RETIRE_MODULE,
         TICKET_MODULE, 'src/session.ts', 'src/transport.ts'],
     },
     'the page reaches the network somewhere new',
@@ -1751,8 +1798,8 @@ test('fetch and new WebSocket match in fifteen known files, and requestsIn yield
 
   const fetching = reaching.get('fetch') ?? [];
   assert.deepEqual(fetching.sort(),
-    [ANSWER_MODULE, CHAT_MODULE, CONTROL_MODULE, DIFF_MODULE, 'src/renderer/floor/away.ts', GIT_MODULE, GOAL_MODULE, LOOK_MODULE, MEMORY_MODULE, 'src/renderer/onboarding/hire.ts', RENAME_MODULE, RETIRE_MODULE, TICKET_MODULE, 'src/session.ts', 'src/transport.ts'],
-    'something other than the session exchange, the Hire, the answer, pause or resume, goal change, Retire, the Git read, the changes read, the memory reads, the away watch and the transport fetches');
+    [ANSWER_MODULE, CHAT_MODULE, CONTROL_MODULE, DIFF_MODULE, 'src/renderer/floor/away.ts', GIT_MODULE, GOAL_MODULE, LOOK_MODULE, MEMORY_MODULE, 'src/renderer/onboarding/hire.ts', RECOVERY_MODULE, RENAME_MODULE, RETIRE_MODULE, TICKET_MODULE, 'src/session.ts', 'src/transport.ts'],
+    'something other than the admitted action, read, session and transport modules fetches');
   assert.deepEqual(calling.sort(), fetching,
     'a module other than those six calls fetch with a space before the parenthesis');
 

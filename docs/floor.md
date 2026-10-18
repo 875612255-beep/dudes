@@ -55,6 +55,26 @@ accepted and changes nothing, because printing is now the default. The link is a
 registered providers and enrolled workspace labels. The Floor reads configuration without editing
 it. **About**, within Settings, shows the daemon, Floor build and browser wire versions.
 
+## Recover an interrupted goal
+
+**Recover interrupted goal** appears in an eligible agent's drawer when both `floor.recovery` and
+`floor.control` are on. Recovery is a separate opt-in that `quickstart` does not enable with its
+bundled Floor actions. Press **Inspect recovery**, read the warning, choose one offered context,
+and press **Authorize one recovery**. Ordinary Resume does not release a recovery barrier.
+Authorization does not guarantee a launch or restored conversation history, and earlier effects may repeat.
+
+Keep the request ID shown in the receipt. If the outcome is unknown, press **Check receipt** while
+the current page retains the request. It remains available to a live authenticated Floor reader
+when recovery is off. After reloading the page, use `dudes recovery receipt <request-id>` with the
+saved ID. Both lookups are read-only and never resubmit recovery. See
+[Recover an interrupted goal](goals-and-stopping.md#recover-an-interrupted-goal) for the command-line steps.
+If unused consent is invalidated, see
+[Make a new choice after unused consent is invalidated](goals-and-stopping.md#make-a-new-choice-after-unused-consent-is-invalidated).
+
+For a ticket, recovery keeps the same goal and round. The ticket review shows recovered attempts
+and whether the last recorded check applies to the current work. After later work is admitted,
+an earlier check is history. Unknown applicability is not a pass.
+
 ## Tickets
 
 With `floor.board` on, the Board view makes tickets and moves them. It needs `floor.control` and

@@ -1140,6 +1140,7 @@ mod native_tests {
             floor_answer_enabled: false,
             floor_hire_enabled: false,
             floor_control: duded::settings::FloorControl::Off,
+            floor_recovery_enabled: false,
             floor_board_enabled: false,
             floor_terminal_enabled: false,
             floor_git_enabled: false,
@@ -1544,6 +1545,10 @@ fn settings_from_environment() -> anyhow::Result<(
     dudes_journal::MemoryCondenseConfig,
     duded::settings::RunOptions,
 )> {
+    #[cfg(feature = "fault-injection")]
+    let recovery_stop = duded::fault::RecoveryStop::parse(
+        std::env::var_os("DUDES_FAULT_RECOVERY_STOP").as_deref(),
+    )?;
     let profile = if cfg!(windows) {
         std::env::var_os("USERPROFILE")
     } else {
@@ -1593,6 +1598,7 @@ fn settings_from_environment() -> anyhow::Result<(
         floor_answer_enabled: operator.answer_enabled,
         floor_hire_enabled: operator.hire_enabled,
         floor_control: operator.control,
+        floor_recovery_enabled: operator.recovery_enabled,
         floor_board_enabled: operator.board_enabled,
         floor_terminal_enabled: operator.terminal_enabled,
         floor_git_enabled: operator.git_enabled,
@@ -1618,7 +1624,10 @@ fn settings_from_environment() -> anyhow::Result<(
             .map(|exe| exe.with_file_name(format!("dudes-hook{}", std::env::consts::EXE_SUFFIX))),
         daemon_exe: exe,
     };
-    Ok((settings, operator.providers, memory, startup.options))
+    let options = startup.options;
+    #[cfg(feature = "fault-injection")]
+    let options = options.with_recovery_stop(recovery_stop);
+    Ok((settings, operator.providers, memory, options))
 }
 
 /// The uid this daemon runs as, which an installed Floor under `share` must belong to. Windows,

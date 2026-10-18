@@ -333,6 +333,27 @@ pub enum TicketAsk {
 )]
 #[derive(Debug)]
 pub enum Ask {
+    /// Inert recovery inspection for an admitted operator.
+    RecoveryInspect {
+        /// Managed agent whose current recovery boundary is inspected.
+        agent: AgentId,
+        /// Transport-verified Operator admission for this read.
+        admission: dudes_rpc::dispatch::OperatorAdmission,
+    },
+    /// One explicit recovery command, with separate live admission.
+    Recover {
+        /// Original intent translated into the supervisor's pure command.
+        command: Box<dudes_supervisor::input::RecoveryCommand>,
+        /// Transport-verified Operator admission for the command-owned appends.
+        admission: dudes_rpc::dispatch::OperatorAdmission,
+    },
+    /// Inert request-ID-only historical lookup.
+    RecoveryReceipt {
+        /// Original command request identity; the lookup never resubmits it.
+        request: dudes_proto::record::Hex32,
+        /// Transport-verified Operator admission for this read.
+        admission: dudes_rpc::dispatch::OperatorAdmission,
+    },
     /// Read or replace the next managed launch's desired server names.
     Mcp(McpParams),
     /// `agent.hire`.
@@ -588,6 +609,12 @@ pub enum Ask {
 /// What the loop answered.
 #[derive(Debug)]
 pub enum Answered {
+    /// Current bounded opportunity.
+    RecoveryInspected(dudes_proto::rpc::recovery::RecoveryInspectResult),
+    /// Durable authorization or a truthful refusal/uncertainty.
+    RecoverySubmitted(dudes_proto::rpc::recovery::RecoverySubmitResult),
+    /// Certified historical receipt read.
+    RecoveryReceipt(dudes_proto::rpc::recovery::RecoveryReceiptResult),
     /// The acknowledged desired set, with whether this call appended a change.
     Mcp(McpResult),
     /// The new agent.
@@ -690,9 +717,49 @@ impl From<HookReply> for HookAnswer {
     }
 }
 
+/// A Floor recovery read could not reach its authenticated checked reader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FloorRecoveryReadError {
+    /// The confirmed session is no longer valid in this listener's registry.
+    Forbidden,
+    /// The writer stopped or its reply was lost.
+    Unavailable,
+}
+
 /// One unit of work for the loop thread.
 #[derive(Debug)]
 pub enum Job {
+    /// Inspect recovery under one authenticated browser session.
+    InspectRecoveryFromFloor {
+        /// Registry-derived reader.
+        session: crate::floor_session::SessionIdentity,
+        /// Managed agent to inspect.
+        agent: dudes_types::AgentId,
+        /// Checked bounded view or a transport refusal.
+        reply: Sender<
+            Result<dudes_proto::rpc::recovery::RecoveryInspectResult, FloorRecoveryReadError>,
+        >,
+    },
+    /// Read one historical recovery receipt without advancing session activity.
+    RecoveryReceiptFromFloor {
+        /// Confirmed reader, independent of the claim's original authority.
+        reader: crate::floor_session::ReceiptSession,
+        /// Retained request identity.
+        request: dudes_proto::record::Hex32,
+        /// Checked historical view or a transport refusal.
+        reply: Sender<
+            Result<dudes_proto::rpc::recovery::RecoveryReceiptResult, FloorRecoveryReadError>,
+        >,
+    },
+    /// One authenticated Floor recovery intent, without caller-supplied attribution.
+    RecoverFromFloor {
+        /// Registry-derived original session.
+        session: crate::floor_session::SessionIdentity,
+        /// Exact already-decoded intent.
+        intent: dudes_proto::rpc::recovery::RecoverySubmitParams,
+        /// Receipt or truthful refusal/uncertainty.
+        reply: Sender<dudes_proto::rpc::recovery::RecoverySubmitResult>,
+    },
     /// Stop one exact owned child whose bounded protocol failed.
     ProtocolFailed(dudes_supervisor::host::AdoptionKey),
     /// A private typed closing operation, after transport authentication.
@@ -831,6 +898,8 @@ pub enum Job {
     PredicateEnded {
         /// The goal the run judged.
         goal: GoalId,
+        /// The immutable resolved execution folder of this run.
+        folder: PathBuf,
         /// Whether it held, and what it rested on; `None` for a run that observed no verdict.
         verdict: Option<(bool, Evidence)>,
     },
@@ -1108,6 +1177,70 @@ impl Handle {
         answers
             .recv()
             .map_err(|_| crate::floor_answer::AnswerRefusal::Unavailable)?
+    }
+
+    pub(crate) fn inspect_floor_recovery(
+        &self,
+        session: crate::floor_session::SessionIdentity,
+        agent: dudes_types::AgentId,
+    ) -> Result<dudes_proto::rpc::recovery::RecoveryInspectResult, FloorRecoveryReadError> {
+        let (reply, answers) = mpsc::channel();
+        self.send_floor(Job::InspectRecoveryFromFloor {
+            session,
+            agent,
+            reply,
+        })
+        .map_err(|_| FloorRecoveryReadError::Unavailable)?;
+        crate::baseline::recv_until_stopping(&self.stopping, &answers)
+            .unwrap_or(Err(FloorRecoveryReadError::Unavailable))
+    }
+
+    pub(crate) fn floor_recovery_receipt(
+        &self,
+        reader: crate::floor_session::ReceiptSession,
+        request: dudes_proto::record::Hex32,
+    ) -> Result<dudes_proto::rpc::recovery::RecoveryReceiptResult, FloorRecoveryReadError> {
+        let (reply, answers) = mpsc::channel();
+        self.send_floor(Job::RecoveryReceiptFromFloor {
+            reader,
+            request,
+            reply,
+        })
+        .map_err(|_| FloorRecoveryReadError::Unavailable)?;
+        crate::baseline::recv_until_stopping(&self.stopping, &answers)
+            .unwrap_or(Err(FloorRecoveryReadError::Unavailable))
+    }
+
+    /// Submit one explicit Floor recovery intent under its actual authenticated identity.
+    /// A lost or stopping reply is unknown and never causes resubmission.
+    pub fn submit_floor_recovery(
+        &self,
+        session: crate::floor_session::SessionIdentity,
+        intent: &dudes_proto::rpc::recovery::RecoverySubmitParams,
+    ) -> dudes_proto::rpc::recovery::RecoverySubmitResult {
+        use dudes_proto::rpc::recovery::{
+            RecoveryKnownPrefix, RecoverySubmitRefusal, RecoverySubmitResult,
+        };
+        let request_id = intent.request_id;
+        let (reply, answers) = mpsc::channel();
+        if self
+            .send_floor(Job::RecoverFromFloor {
+                session,
+                intent: *intent,
+                reply,
+            })
+            .is_err()
+        {
+            return RecoverySubmitResult::Refused {
+                reason: RecoverySubmitRefusal::Unavailable,
+                prefix: RecoveryKnownPrefix {
+                    required: None,
+                    resume: None,
+                },
+            };
+        }
+        crate::baseline::recv_until_stopping(&self.stopping, &answers)
+            .unwrap_or(RecoverySubmitResult::Unknown { request_id })
     }
     pub(crate) fn control(
         &self,
@@ -1488,8 +1621,17 @@ impl Handle {
 
     /// Report that one predicate run ended. Silently dropped once the loop has stopped, as
     /// [`Self::input`] is.
-    pub(crate) fn predicate_ended(&self, goal: GoalId, verdict: Option<(bool, Evidence)>) {
-        let sent = self.jobs.send(Job::PredicateEnded { goal, verdict });
+    pub(crate) fn predicate_ended(
+        &self,
+        goal: GoalId,
+        folder: PathBuf,
+        verdict: Option<(bool, Evidence)>,
+    ) {
+        let sent = self.jobs.send(Job::PredicateEnded {
+            goal,
+            folder,
+            verdict,
+        });
         #[cfg(feature = "testing")]
         if sent.is_ok() {
             self.predicate_completions.fetch_add(1, Ordering::Release);
@@ -2545,6 +2687,323 @@ mod tests {
         assert!(
             source.is_sealed(),
             "a validation, provider, persistence, or spawn failure cannot reopen acquisition"
+        );
+    }
+}
+
+impl dudes_rpc::methods::recovery::RecoveryControl for Handle {
+    fn inspect_recovery(
+        &self,
+        params: dudes_proto::rpc::recovery::RecoveryInspectParams,
+        admission: dudes_rpc::dispatch::OperatorAdmission,
+    ) -> Result<dudes_proto::rpc::recovery::RecoveryInspectResult, RpcError> {
+        match self.ask(Ask::RecoveryInspect {
+            agent: params.agent,
+            admission,
+        })? {
+            Answered::RecoveryInspected(result) => Ok(result),
+            _ => Err(unavailable()),
+        }
+    }
+
+    fn submit_recovery(
+        &self,
+        params: &dudes_proto::rpc::recovery::RecoverySubmitParams,
+        admission: dudes_rpc::dispatch::OperatorAdmission,
+    ) -> Result<dudes_proto::rpc::recovery::RecoverySubmitResult, RpcError> {
+        let command = recovery_command(
+            params,
+            dudes_proto::recovery::RecoveryAttribution::LocalOperator {
+                pid: admission.pid(),
+                uid: admission.uid(),
+            },
+        )?;
+        let request_id = command.request_id;
+        match self.ask(Ask::Recover {
+            command: Box::new(command),
+            admission,
+        }) {
+            Ok(Answered::RecoverySubmitted(result)) => Ok(result),
+            _ => Ok(dudes_proto::rpc::recovery::RecoverySubmitResult::Unknown { request_id }),
+        }
+    }
+
+    fn recovery_receipt(
+        &self,
+        params: dudes_proto::rpc::recovery::RecoveryReceiptParams,
+        admission: dudes_rpc::dispatch::OperatorAdmission,
+    ) -> Result<dudes_proto::rpc::recovery::RecoveryReceiptResult, RpcError> {
+        match self.ask(Ask::RecoveryReceipt {
+            request: params.request_id,
+            admission,
+        })? {
+            Answered::RecoveryReceipt(result) => Ok(result),
+            _ => Err(unavailable()),
+        }
+    }
+}
+
+pub(crate) fn recovery_command(
+    params: &dudes_proto::rpc::recovery::RecoverySubmitParams,
+    attribution: dudes_proto::recovery::RecoveryAttribution,
+) -> Result<dudes_supervisor::input::RecoveryCommand, RpcError> {
+    use dudes_supervisor::input::{RecoveryChoice, RecoveryCommand, RecoveryExpected};
+    let digest = recovery_digest(params)?;
+    Ok(RecoveryCommand {
+        request_id: params.request_id,
+        digest,
+        expected: RecoveryExpected {
+            work: params.expected.work,
+            issue_lsn: params.expected.issue_lsn,
+            source_lsn: params.expected.source_lsn,
+            episode: params.expected.episode,
+            predecessor: params.expected.expected_predecessor,
+            control_lsn: params.expected.control_lsn,
+            ticket: params
+                .expected
+                .ticket
+                .map(|ticket| (ticket.card, ticket.round)),
+        },
+        choice: match params.choice {
+            dudes_proto::rpc::recovery::RecoveryChoice::TryRecorded => RecoveryChoice::TryRecorded,
+            dudes_proto::rpc::recovery::RecoveryChoice::FreshWithRecap => {
+                RecoveryChoice::FreshWithRecap
+            }
+            dudes_proto::rpc::recovery::RecoveryChoice::RepeatIssuedFresh => {
+                RecoveryChoice::RepeatIssuedFresh
+            }
+        },
+        attribution,
+    })
+}
+
+fn recovery_digest(
+    params: &dudes_proto::rpc::recovery::RecoverySubmitParams,
+) -> Result<dudes_proto::record::Hex32, RpcError> {
+    use sha2::{Digest as _, Sha256};
+    let bytes = serde_json::to_vec(params).map_err(|_| unavailable())?;
+    let mut digest = Sha256::new();
+    digest.update(b"dudes.recovery.intent.v1\0");
+    digest.update(&bytes);
+    Ok(dudes_proto::record::Hex32::new(digest.finalize().into()))
+}
+
+#[cfg(test)]
+mod recovery_intent_tests {
+    use super::recovery_digest;
+    use dudes_proto::rpc::recovery::{RecoveryChoice, RecoverySubmitParams};
+
+    const INTENT: &str = concat!(
+        "{\"request_id\":\"0101010101010101010101010101010101010101010101010101010101010101\",",
+        "\"expected\":{\"work\":{\"agent\":\"00000000010000000000000001\",\"goal\":\"00000000010000000000000002\",\"turn\":\"00000000010000000000000003\"},",
+        "\"issue_lsn\":5,\"source_lsn\":9,\"episode\":null,\"expected_predecessor\":null,\"control_lsn\":null,\"ticket\":null},\"choice\":\"fresh_with_recap\"}"
+    );
+
+    fn fully_selected_intent() -> RecoverySubmitParams {
+        let original: RecoverySubmitParams = serde_json::from_str(INTENT).unwrap();
+        let mut full = original;
+        let episode = dudes_proto::recovery::RecoveryEpisodeId {
+            work: original.expected.work,
+            origin: dudes_types::Lsn(7),
+        };
+        full.expected.episode = Some(episode);
+        full.expected.expected_predecessor = Some(dudes_proto::recovery::RecoveryClaimRef {
+            episode,
+            authorization_lsn: dudes_types::Lsn(11),
+        });
+        full.expected.control_lsn = Some(dudes_types::Lsn(8));
+        full.expected.ticket = Some(dudes_proto::rpc::recovery::ReviewedTicketRound {
+            card: dudes_types::CardId::from_parts(1, 4),
+            round: 1,
+        });
+        full
+    }
+
+    #[test]
+    fn original_typed_intent_has_a_fixed_canonical_encoding_including_explicit_nulls() {
+        let original: RecoverySubmitParams = serde_json::from_str(INTENT).unwrap();
+        assert_eq!(serde_json::to_string(&original).unwrap(), INTENT);
+        let digest = recovery_digest(&original).unwrap();
+        assert_eq!(
+            digest,
+            dudes_proto::record::Hex32::new([
+                141, 78, 75, 201, 121, 169, 184, 232, 115, 87, 134, 160, 145, 51, 114, 43, 95, 141,
+                112, 143, 169, 97, 133, 2, 145, 206, 239, 95, 31, 164, 173, 168
+            ])
+        );
+        let mut edits = Vec::new();
+        let mut changed = original;
+        changed.choice = RecoveryChoice::TryRecorded;
+        edits.push(changed);
+        changed = original;
+        changed.request_id = dudes_proto::record::Hex32::new([2; 32]);
+        edits.push(changed);
+        changed = original;
+        changed.expected.issue_lsn = dudes_types::Lsn(6);
+        edits.push(changed);
+        changed = original;
+        changed.expected.source_lsn = dudes_types::Lsn(10);
+        edits.push(changed);
+        changed = original;
+        changed.expected.control_lsn = Some(dudes_types::Lsn(8));
+        edits.push(changed);
+        changed = original;
+        changed.expected.episode = Some(dudes_proto::recovery::RecoveryEpisodeId {
+            work: original.expected.work,
+            origin: dudes_types::Lsn(7),
+        });
+        edits.push(changed);
+        changed.expected.expected_predecessor = Some(dudes_proto::recovery::RecoveryClaimRef {
+            episode: changed.expected.episode.unwrap(),
+            authorization_lsn: dudes_types::Lsn(11),
+        });
+        edits.push(changed);
+        changed = original;
+        changed.expected.ticket = Some(dudes_proto::rpc::recovery::ReviewedTicketRound {
+            card: dudes_types::CardId::from_parts(1, 4),
+            round: 1,
+        });
+        edits.push(changed);
+        let full = fully_selected_intent();
+        assert_eq!(
+            recovery_digest(&full).unwrap(),
+            dudes_proto::record::Hex32::new([
+                150, 248, 228, 205, 168, 194, 133, 57, 184, 63, 32, 137, 92, 135, 51, 65, 202, 63,
+                201, 46, 228, 133, 221, 48, 97, 222, 189, 250, 41, 3, 188, 171
+            ])
+        );
+        for changed in edits {
+            assert_ne!(recovery_digest(&changed).unwrap(), digest, "{changed:?}");
+        }
+    }
+
+    #[test]
+    fn every_nested_selector_is_part_of_the_canonical_intent_digest() {
+        let original = fully_selected_intent();
+        let expected = recovery_digest(&original).unwrap();
+        let json = serde_json::to_value(original).unwrap();
+        for pointer in [
+            "/expected/work/agent",
+            "/expected/work/goal",
+            "/expected/work/turn",
+            "/expected/episode/work/agent",
+            "/expected/episode/work/goal",
+            "/expected/episode/work/turn",
+            "/expected/expected_predecessor/episode/work/agent",
+            "/expected/expected_predecessor/episode/work/goal",
+            "/expected/expected_predecessor/episode/work/turn",
+            "/expected/ticket/card",
+        ] {
+            let mut changed = json.clone();
+            *changed.pointer_mut(pointer).unwrap() =
+                serde_json::json!("00000000010000000000000009");
+            let changed: RecoverySubmitParams = serde_json::from_value(changed).unwrap();
+            assert_ne!(recovery_digest(&changed).unwrap(), expected, "{pointer}");
+        }
+        for pointer in [
+            "/expected/episode/origin",
+            "/expected/expected_predecessor/episode/origin",
+            "/expected/expected_predecessor/authorization_lsn",
+            "/expected/ticket/round",
+        ] {
+            let mut changed = json.clone();
+            *changed.pointer_mut(pointer).unwrap() = serde_json::json!(19);
+            let changed: RecoverySubmitParams = serde_json::from_value(changed).unwrap();
+            assert_ne!(recovery_digest(&changed).unwrap(), expected, "{pointer}");
+        }
+    }
+
+    #[test]
+    fn dropped_floor_recovery_reply_keeps_the_original_request_unknown_without_retry() {
+        use super::{Handle, Job};
+        use dudes_proto::rpc::recovery::RecoverySubmitResult;
+        use std::sync::{Arc, mpsc};
+        let sessions = crate::floor_session::FloorSessions::new(
+            "127.0.0.1:43123".parse().unwrap(),
+            Arc::new(dudes_supervisor::testing::FakeClock::frozen(0)),
+        );
+        let exchange = sessions
+            .exchange(
+                "127.0.0.1:43123",
+                "http://127.0.0.1:43123",
+                sessions.issue().unwrap().bootstrap.as_bytes(),
+            )
+            .unwrap();
+        let identity = sessions
+            .authorize_onboard(
+                "127.0.0.1:43123",
+                "http://127.0.0.1:43123",
+                &exchange.cookie,
+                &exchange.csrf,
+            )
+            .unwrap();
+        let digest = identity.digest();
+        let intent: RecoverySubmitParams = serde_json::from_str(INTENT).unwrap();
+        let (sender, jobs) = mpsc::channel();
+        let handle = Handle::new(sender);
+        std::thread::scope(|scope| {
+            let call = scope.spawn(|| handle.submit_floor_recovery(identity, &intent));
+            let Job::RecoverFromFloor {
+                session,
+                intent: queued,
+                reply,
+            } = jobs
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+            else {
+                panic!("exact recovery job");
+            };
+            assert_eq!(session.digest(), digest);
+            assert_eq!(queued, intent);
+            drop(reply);
+            assert_eq!(
+                call.join().unwrap(),
+                RecoverySubmitResult::Unknown {
+                    request_id: intent.request_id
+                }
+            );
+            assert!(matches!(jobs.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        });
+    }
+
+    #[test]
+    fn unsent_floor_recovery_is_refused_with_no_acknowledged_prefix() {
+        use super::Handle;
+        use dudes_proto::rpc::recovery::{
+            RecoveryKnownPrefix, RecoverySubmitRefusal, RecoverySubmitResult,
+        };
+        use std::sync::{Arc, mpsc};
+        let sessions = crate::floor_session::FloorSessions::new(
+            "127.0.0.1:43123".parse().unwrap(),
+            Arc::new(dudes_supervisor::testing::FakeClock::frozen(0)),
+        );
+        let exchange = sessions
+            .exchange(
+                "127.0.0.1:43123",
+                "http://127.0.0.1:43123",
+                sessions.issue().unwrap().bootstrap.as_bytes(),
+            )
+            .unwrap();
+        let identity = sessions
+            .authorize_onboard(
+                "127.0.0.1:43123",
+                "http://127.0.0.1:43123",
+                &exchange.cookie,
+                &exchange.csrf,
+            )
+            .unwrap();
+        let intent: RecoverySubmitParams = serde_json::from_str(INTENT).unwrap();
+        let (sender, jobs) = mpsc::channel();
+        drop(jobs);
+        assert_eq!(
+            Handle::new(sender).submit_floor_recovery(identity, &intent),
+            RecoverySubmitResult::Refused {
+                reason: RecoverySubmitRefusal::Unavailable,
+                prefix: RecoveryKnownPrefix {
+                    required: None,
+                    resume: None
+                }
+            }
         );
     }
 }

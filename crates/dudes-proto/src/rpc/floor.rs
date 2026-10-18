@@ -549,12 +549,16 @@ pub struct SettingsView {
     pub about: SettingsAbout,
 }
 
+/// The empty snapshot sibling advertising effective browser recovery for this subscription.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct RecoveryView {}
+
 /// The finite Floor switch allowlist.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "the explicit read-only wire reports eight configured switch facts"
+    reason = "the explicit read-only wire reports nine configured switch facts"
 )]
 pub struct SettingsSwitches {
     /// Browser question answering.
@@ -563,6 +567,8 @@ pub struct SettingsSwitches {
     pub hire: bool,
     /// Browser pause, resume and rename.
     pub control: bool,
+    /// Browser recovery, effective only alongside pause and resume.
+    pub recovery: bool,
     /// Browser goal text changes.
     pub goal: bool,
     /// Browser renewal of a goal that has nothing left, from its workspace's enrolled allowance.
