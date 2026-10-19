@@ -37,6 +37,7 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use chrono::TimeZone;
+use dudes_proto::decision::AutomaticHold;
 use dudes_proto::decision::LoopDecision;
 use dudes_proto::rpc::agent::{HireResult, McpResult, WhyResult};
 use dudes_proto::rpc::board::CardCreateResult;
@@ -47,7 +48,7 @@ use dudes_proto::rpc::system::PingResult;
 use dudes_proto::rpc::{Empty, RpcError};
 use dudes_proto::{AgentView, CardView};
 pub use dudes_types::Escaped;
-use dudes_types::Lsn;
+use dudes_types::{Lsn, Provider};
 use serde::Serialize;
 
 use crate::config;
@@ -788,9 +789,35 @@ pub fn agents(out: &mut dyn Write, machine: bool, agents: &[AgentView]) -> io::R
         )?;
         if let Some(cause) = &agent.automatic_hold {
             writeln!(out, "  held: {}", Escaped(&cause.to_string()))?;
+            if let Some(hint) = missing_engine_hint(agent.provider, cause, &agent.id.to_string()) {
+                writeln!(out, "  {hint}")?;
+            }
         }
     }
     Ok(())
+}
+
+/// The engines a newcomer may hire and the program the daemon looks for.
+const ENGINES: [(Provider, &str, &str); 3] = [
+    (Provider::Claude, "Claude Code", "claude"),
+    (Provider::Codex, "Codex", "codex"),
+    (Provider::Pi, "Pi", "pi"),
+];
+
+/// What to do about a launch that failed with a not-found error. The recorded reason ends in the
+/// error kind and names no engine, and other not-found errors share it, so the program is only
+/// the usual cause.
+fn missing_engine_hint(provider: Provider, cause: &AutomaticHold, agent: &str) -> Option<String> {
+    let AutomaticHold::LaunchFailed { reason } = cause else {
+        return None;
+    };
+    if !reason.ends_with("(NotFound)") {
+        return None;
+    }
+    let (_, name, program) = ENGINES.into_iter().find(|(known, ..)| *known == provider)?;
+    Some(format!(
+        "Dudes could not start {name}, usually because `{program}` is not installed. Install it and sign in, then run `dudes resume {agent}`, or hire an agent with an engine you have."
+    ))
 }
 
 /// Render the public roster as JSON or escaped human text.
@@ -1491,6 +1518,41 @@ mod tests {
         let human = text(|out| agents(out, false, &[agent]));
         assert!(human.contains("Claude  Hold"), "{human}");
         assert!(human.contains("held: launch failed: managed process could not launch (NotFound); fix the cause and resume"), "{human}");
+        assert_eq!(
+            human,
+            format!(
+                "{id}  Hector  infra  Claude  Hold\n  held: launch failed: managed process could not launch (NotFound); fix the cause and resume\n  Dudes could not start Claude Code, usually because `claude` is not installed. Install it and sign in, then run `dudes resume {id}`, or hire an agent with an engine you have.\n",
+                id = an_agent()
+            )
+        );
+    }
+
+    #[test]
+    fn a_not_found_launch_names_the_usual_program() {
+        for (provider, name, program) in [("codex", "Codex", "codex"), ("pi", "Pi", "pi")] {
+            let agent: AgentView = serde_json::from_value(serde_json::json!({
+                "id": an_agent(), "name": "Hector", "role": "infra", "department": "infra",
+                "provider": provider, "status": "idle", "mode": "managed",
+                "automatic_hold": { "kind": "launch_failed", "reason": "managed process could not launch (NotFound)" }
+            })).expect("agent view");
+            let human = text(|out| agents(out, false, &[agent]));
+            assert!(
+                human.contains(&format!(
+                    "Dudes could not start {name}, usually because `{program}` is not installed. Install it"
+                )),
+                "{human}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_launch_failures_get_no_engine_hint() {
+        let agent: AgentView = serde_json::from_value(serde_json::json!({
+            "id": an_agent(), "name": "Hector", "role": "infra", "department": "infra",
+            "provider": "claude", "status": "idle", "mode": "managed",
+            "automatic_hold": { "kind": "launch_failed", "reason": "managed process could not launch (PermissionDenied)" }
+        })).expect("agent view");
+        assert!(!text(|out| agents(out, false, &[agent])).contains("Dudes could not start"));
     }
 
     /// OSC 52 (writes the clipboard), a CSI and its one-byte C1 form, DEL, a newline that starts a
