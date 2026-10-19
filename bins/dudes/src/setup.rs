@@ -44,6 +44,9 @@ pub struct Plan {
     /// The operator agreed that a running daemon with other settings is stopped and started
     /// again, which ends any turn it is running.
     pub restart: bool,
+    /// `--yes`: turn on the Floor actions the first task needs, unless the file already turns
+    /// any Floor action on.
+    pub floor_default: bool,
 }
 
 /// A completion check: a typed argv the daemon resolves and runs itself, never a shell string.
@@ -363,12 +366,7 @@ fn engines_step(
 /// One question for the Floor's actions, or one line when the file already holds its own mix.
 fn floor_step(term: &mut Terminal<'_>, draft: &mut Draft, plan: &mut Plan) -> Result<(), Stopped> {
     term.say("")?;
-    let settings = draft.settings();
-    let on = FLOOR_ACTIONS
-        .iter()
-        .filter(|key| settings.satisfies(**key))
-        .count();
-    if on != 0 && on != FLOOR_ACTIONS.len() {
+    if !floor_is_uniform(draft.settings()) {
         return Ok(term.say(
             "Floor actions: your file already chooses which ones are on, so quickstart keeps that \
              choice.",
@@ -381,6 +379,46 @@ fn floor_step(term: &mut Terminal<'_>, draft: &mut Draft, plan: &mut Plan) -> Re
          act with your account's full reach.",
         true,
     )?;
+    set_floor(draft, plan, allow)
+}
+
+/// Whether the file has every Floor action on or every one off, so one answer can settle them.
+#[must_use]
+pub fn floor_is_uniform(settings: &Settings) -> bool {
+    let on = FLOOR_ACTIONS
+        .iter()
+        .filter(|key| settings.satisfies(**key))
+        .count();
+    on == 0 || on == FLOOR_ACTIONS.len()
+}
+
+/// The Floor actions `--yes` turns on. Terminal, renew and retire stay as they are.
+const YES_ACTIONS: [Key; 5] = [Key::Answer, Key::Hire, Key::Control, Key::Goal, Key::Board];
+
+/// Turn on [`YES_ACTIONS`] when the file turns no Floor action on yet.
+///
+/// # Errors
+///
+/// [`Stopped`] when the file refuses a change.
+pub fn set_yes_floor(draft: &mut Draft, plan: &mut Plan) -> Result<(), Stopped> {
+    if FLOOR_ACTIONS
+        .iter()
+        .any(|key| draft.settings().satisfies(*key))
+    {
+        return Ok(());
+    }
+    for key in YES_ACTIONS {
+        set(draft, plan, key, true)?;
+    }
+    Ok(())
+}
+
+/// Turn every Floor action on or off, and Renew off with them.
+///
+/// # Errors
+///
+/// [`Stopped`] when the file refuses a change.
+pub fn set_floor(draft: &mut Draft, plan: &mut Plan, allow: bool) -> Result<(), Stopped> {
     for key in FLOOR_ACTIONS {
         if allow != draft.settings().satisfies(key) {
             set(draft, plan, key, allow)?;
@@ -989,6 +1027,21 @@ mod tests {
             assert!(!run.draft.settings().satisfies(key), "{key}:\n{shown}");
         }
         assert!(run.draft.settings().problems().is_empty(), "{shown}");
+    }
+
+    /// `--yes` turns on what the first task needs; terminal, renew, retire and the git views stay off.
+    #[test]
+    fn the_yes_floor_turns_on_five_actions_only() {
+        let home = tempfile::tempdir().expect("a home");
+        let mut draft = Draft::open(&home.path().join("config.toml")).expect("opens");
+        let mut plan = Plan::default();
+        set_yes_floor(&mut draft, &mut plan).expect("sets");
+        for key in YES_ACTIONS {
+            assert!(draft.settings().satisfies(key), "{key}");
+        }
+        for key in [Key::Terminal, Key::Retire, Key::Renew, Key::Git, Key::Diff] {
+            assert!(!draft.settings().satisfies(key), "{key}");
+        }
     }
 
     /// A file that already mixes the switches keeps its mix and is told so, with no question.

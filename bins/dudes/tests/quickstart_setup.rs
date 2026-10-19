@@ -625,7 +625,7 @@ fn codex_streaming_changes_restart_once_without_disabling_codex() {
         assert_eq!(changed.code(), dudes::exit::SUCCESS, "{changed:?}");
         let stale = layout.cli().args(["quickstart", "--yes"]).run();
         assert_eq!(stale.code(), dudes::exit::OTHER, "{stale:?}");
-        assert!(stale.stderr.contains("(providers.codex)"), "{stale:?}");
+        assert!(stale.stderr.contains("providers.codex"), "{stale:?}");
         assert_eq!(layout.daemons(), before);
         let restarted = layout.cli().args(["quickstart", "--restart"]).run();
         assert_eq!(restarted.code(), dudes::exit::SUCCESS, "{restarted:?}");
@@ -1117,6 +1117,20 @@ fn a_responding_daemon_without_a_config_defaults_hiring_to_no() {
     let agents: Vec<dudes_proto::AgentView> = listed.json();
     assert!(agents.is_empty(), "{listed:?}");
     assert_only_status_checks(&layout);
+}
+
+#[test]
+fn yes_turns_on_five_floor_actions_and_leaves_the_rest_off() {
+    let layout = Layout::new();
+    let started = layout.cli().args(["quickstart", "--yes"]).run();
+    assert_eq!(started.code(), 0, "{started:?}");
+    let file = Settings::read(&layout.config()).unwrap();
+    for key in [Key::Answer, Key::Hire, Key::Control, Key::Goal, Key::Board] {
+        assert!(file.satisfies(key), "{key}");
+    }
+    for key in [Key::Terminal, Key::Retire, Key::Git, Key::Diff] {
+        assert!(!file.satisfies(key), "{key}");
+    }
 }
 
 #[test]

@@ -565,8 +565,11 @@ COMMANDS
         paste into any browser.
         With options it asks nothing and prints no Floor link: it prints, last, dudes
         floor open, after dudes login <engine> for each engine that is signed out. --yes
-        takes every default, --set is `config set`, --enroll enrolls the current
-        repository, --hire hires a first agent there, and everything after `--` is
+        takes every default, including turning on the Floor's hire, goal, control, answer
+        and board actions when the file turns none on (terminal, renew, retire and the
+        git and diff views stay off), --set is `config set`, --enroll enrolls the
+        current repository, --hire hires a first
+        agent there, and everything after `--` is
         the completion check that the workspace and the goal share (default: at
         most 5 turns a goal, 600 seconds a check). A running daemon with other
         settings is restarted only with --restart, because a restart ends
@@ -2091,7 +2094,7 @@ fn quickstart(
     let mut given = QuickstartFlags::default();
     while let Some(arg) = flags.next() {
         match arg.to_string_lossy().as_ref() {
-            "--yes" => {}
+            "--yes" => given.yes = true,
             "--restart" => given.restart = true,
             "--set" => {
                 let word = flags.value("--set")?;
@@ -2174,6 +2177,7 @@ fn above_zero<T: std::str::FromStr + Default + PartialEq>(
 /// Every option `quickstart` was given, before they are checked against each other.
 #[derive(Default)]
 struct QuickstartFlags {
+    yes: bool,
     restart: bool,
     changes: Vec<Change>,
     enroll: bool,
@@ -2195,6 +2199,7 @@ impl QuickstartFlags {
     /// The plan these options and the check's `argv` make, or the first option that needs another.
     fn into_plan(self, argv: Vec<String>) -> Result<Plan, ArgError> {
         let Self {
+            yes,
             restart,
             changes,
             enroll,
@@ -2276,6 +2281,7 @@ impl QuickstartFlags {
             enroll,
             hire,
             restart,
+            floor_default: yes,
         })
     }
 }
@@ -3426,7 +3432,10 @@ mod tests {
         assert_eq!(command(&["quickstart"]), Ok(Command::Quickstart(None)));
         assert_eq!(
             command(&["quickstart", "--yes"]),
-            Ok(Command::Quickstart(Some(Box::default())))
+            Ok(Command::Quickstart(Some(Box::new(Plan {
+                floor_default: true,
+                ..Plan::default()
+            }))))
         );
         assert_eq!(
             command(&["quickstart", "--loud"]),
@@ -3473,6 +3482,7 @@ mod tests {
                     tokens_per_day: None,
                 }),
                 restart: false,
+                floor_default: false,
             }))))
         );
         assert_eq!(
