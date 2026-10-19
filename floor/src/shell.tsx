@@ -16,9 +16,9 @@ import { refreshFloorSnapshot } from './renderer/floor/stream';
 import { HireWizard } from './renderer/onboarding/HireWizard';
 import { HireEntry, hireSwitchOn } from './renderer/onboarding/HireEntry';
 import { FirstRunGuide } from './renderer/setup/FirstRunGuide';
-import { shouldOpenFirstRunGuide } from './renderer/setup/guide';
+import { FirstTask } from './renderer/setup/FirstTask.tsx';
 import {
-  agentToReveal, getHireState, markRevealed, prepareArchiveHire, subscribeToHire,
+  agentToReveal, getHireState, markRevealed, prepareArchiveHire, prepareHire, subscribeToHire,
 } from './renderer/onboarding/hire';
 import type { RetiredAgentRow } from './renderer/archive';
 import { AGENT_DETAIL_HEADING_ID, closesDrawer, focusAnswer, handFocusOnLeave, restoreFocusAfterDialog } from './renderer/focus';
@@ -36,7 +36,7 @@ import './failure.css';
 import {
   DEFAULT_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH,
   focusAgentId, isFocusShortcut, keyboardSidebarWidth, pointerSidebarWidth,
-  readGuideClosed, readViewPreferences, rememberGuideClosed, toggleTheme, writeViewPreferences,
+  readViewPreferences, rememberGuideClosed, toggleTheme, writeViewPreferences,
 } from './renderer/view';
 
 /**
@@ -120,7 +120,7 @@ function SignedInShell() {
   const floor = useSyncExternalStore(subscribeToFloor, getFloorState, getFloorState);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [hiring, setHiring] = useState(false);
-  const [guide, setGuide] = useState<'auto' | 'open' | 'closed'>(() => readGuideClosed() ? 'closed' : 'auto');
+  const [guide, setGuide] = useState<'open' | 'closed'>('closed');
   const [archiveHireKept, setArchiveHireKept] = useState(false);
   const [officeBar, setOfficeBar] = useState<HTMLDivElement | null>(null);
   const hire = useSyncExternalStore(subscribeToHire, getHireState, getHireState);
@@ -168,10 +168,6 @@ function SignedInShell() {
   useEffect(() => {
     writeViewPreferences(preferences);
   }, [preferences]);
-
-  useEffect(() => {
-    if (guide === 'auto' && shouldOpenFirstRunGuide(floor, false)) setGuide('open');
-  }, [guide, floor]);
 
   useEffect(() => {
     const preference = window.matchMedia('(prefers-color-scheme: dark)');
@@ -267,6 +263,7 @@ function SignedInShell() {
   function openHire(opener: HTMLElement | null): void {
     backdropPress.current = null;
     hireOpener.current = opener;
+    prepareHire(floor);
     setHiring(true);
   }
 
@@ -399,6 +396,7 @@ function SignedInShell() {
             selectable={selectable} stale={floor.stale} onSelectAgent={selectAgent} onOpenQuestion={openQuestion}
             onOpenTicket={openCard} />}
         </div>
+        <FirstTask floor={floor} onHire={openHire} />
         <DoneNotices notices={floor.doneNotices} leaveFocusTo={home} />
         <div className="stage-center">
           <TerminalPanel floor={floor} theme={effectiveTheme} />
