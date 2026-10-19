@@ -194,7 +194,11 @@ pub enum WorkspaceError {
     #[error(
         "The check program `{program}` is inside the project's repository. An agent working \
          there could change it, so it cannot be the judge of the agent's work. Use a program \
-         outside the repository instead, for example the project's usual test command."
+         installed outside the repository, such as the project's usual test command. To use a \
+         script from the repository, run it through its interpreter, for example \
+         `sh {example}` for a shell script. The agent can still edit that script, so review its \
+         changes before you accept the work.",
+        example = quoted_word(.program)
     )]
     CheckInsideRepository {
         /// The program as typed.
@@ -263,6 +267,15 @@ pub struct Edit {
     pub previous: Option<Vec<u8>>,
     /// Exactly what was written.
     pub written: Vec<u8>,
+}
+
+/// `word` quoted when it holds whitespace or a quote, so the example in a refusal can be pasted.
+fn quoted_word(word: &str) -> String {
+    if word.contains(|c: char| c.is_whitespace() || c == '\'') {
+        format!("'{}'", word.replace('\'', r"'\''"))
+    } else {
+        word.to_owned()
+    }
 }
 
 impl Edit {
