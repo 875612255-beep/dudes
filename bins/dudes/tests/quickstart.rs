@@ -647,6 +647,59 @@ fn a_socket_runtime_divergence_leaves_no_daemon() {
     drop(guard);
 }
 
+/// A socket path longer than `sun_path` is refused with its length and the way out, for both
+/// `quickstart` and `start`, before any process is created.
+#[cfg(unix)]
+#[test]
+fn a_socket_path_too_long_to_bind_is_refused_before_a_daemon_starts() {
+    let root = tempfile::tempdir().expect("a long home");
+    let daemon = daemon_binary();
+    let runtime = root.path().join("r".repeat(110));
+    for command in ["quickstart", "start"] {
+        let run = cli(root.path(), &daemon)
+            .env("DUDES_RUNTIME_DIR", &runtime)
+            .args([command])
+            .run();
+        let guard = DaemonGuard::from_root(root.path());
+        assert_eq!(run.code(), dudes::exit::OTHER, "{command}: {run:?}");
+        assert!(run.stdout.is_empty(), "{command}: {run:?}");
+        assert!(run.stderr.contains("bytes long"), "{command}: {run:?}");
+        assert!(
+            run.stderr.contains("DUDES_RUNTIME_DIR"),
+            "{command}: {run:?}"
+        );
+        assert!(!runtime.exists(), "{command} created the directory");
+        drop(guard);
+    }
+}
+
+/// A long `HOME` with no runtime directory override makes the derived socket too long, and the
+/// refusal says how to shorten it.
+#[cfg(unix)]
+#[test]
+fn a_long_home_without_a_runtime_directory_is_refused_before_a_daemon_starts() {
+    let root = tempfile::tempdir().expect("a root");
+    let home = root.path().join("h".repeat(110));
+    let daemon = daemon_binary();
+    for command in ["quickstart", "start"] {
+        let run = Cli::bare()
+            .env("DUDES_STATE_DIR", root.path().join("state"))
+            .env("DUDES_DAEMON", &daemon)
+            .env("HOME", &home)
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .args([command])
+            .run();
+        assert_eq!(run.code(), dudes::exit::OTHER, "{command}: {run:?}");
+        assert!(run.stdout.is_empty(), "{command}: {run:?}");
+        assert!(run.stderr.contains("bytes long"), "{command}: {run:?}");
+        assert!(
+            run.stderr.contains("DUDES_RUNTIME_DIR"),
+            "{command}: {run:?}"
+        );
+        assert!(!home.exists(), "{command} created the home directory");
+    }
+}
+
 /// A `DUDES_CONFIG` the daemon would refuse is reported on the terminal with the daemon's own
 /// reason, and no daemon is started.
 #[test]
