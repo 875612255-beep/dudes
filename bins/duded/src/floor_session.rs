@@ -692,6 +692,9 @@ struct Inner {
     last_browser_epoch: AtomicU64,
     registry: registry::Registry,
     reserve_hook: Mutex<Option<ReserveHook>>,
+    /// Random for this run. It stands in for the key of a session that does not exist, so a proof
+    /// asked for twice under such a cookie is the same both times, as it is under a live one.
+    absent_key: [u8; 32],
 }
 
 /// The session registry: its state, and the clock that dates it, reachable only together.
@@ -906,6 +909,11 @@ impl FloorSessions {
             last_browser_epoch: AtomicU64::new(0),
             registry: registry::Registry::new(clock),
             reserve_hook: Mutex::new(None),
+            absent_key: {
+                let mut bytes = [0_u8; 32];
+                getrandom::fill(&mut bytes).expect("the operating system's entropy source");
+                bytes
+            },
         }))
     }
 
@@ -999,6 +1007,47 @@ impl FloorSessions {
     /// news about the session, because every session was just cleared.
     pub(crate) fn is_running(&self) -> bool {
         self.0.valid.load(Ordering::Acquire)
+    }
+
+    /// Prove to a page that this daemon holds the session it signed in to, before the page sends
+    /// its secret. The answer is a keyed hash of the page's nonce, bound to this purpose by a fixed
+    /// label and to this listener's own origin, keyed by the digest of the session's secret: only a
+    /// holder of that digest can make one the page accepts, a process that relays the page's nonce
+    /// to a daemon on another port gets an answer for that port's origin, and the secret itself is
+    /// never needed. A cookie that names no live
+    /// session, or none at all, gets an answer of the same shape under a key nobody holds, so the
+    /// answer says nothing about which sessions exist. Asking leaves the idle deadline alone.
+    pub(crate) fn prove(&self, cookie: Option<&str>, nonce: &str) -> String {
+        let held = cookie.and_then(|cookie| {
+            let cookie = digest(cookie.as_bytes());
+            let registry::Locked { state, now } = self.0.registry.lock_at_now();
+            if !self.0.valid.load(Ordering::Acquire) {
+                return None;
+            }
+            let session = state.sessions.get(&cookie)?;
+            if !session.live_at(now) || session.revoked.load(Ordering::Acquire) {
+                return None;
+            }
+            session.csrf
+        });
+        let key = held.unwrap_or_else(|| {
+            digest(
+                &[
+                    self.0.absent_key.as_slice(),
+                    cookie.unwrap_or_default().as_bytes(),
+                ]
+                .concat(),
+            )
+        });
+        base64url(&hmac_sha256_key32(
+            &key,
+            &[
+                PROOF_LABEL,
+                self.0.origin.as_bytes(),
+                b"\n",
+                nonce.as_bytes(),
+            ],
+        ))
     }
 
     /// End this run's authority before its listener and connection owners are released.
@@ -1140,6 +1189,29 @@ impl Inner {
 
 fn digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
+}
+
+/// Binds a proof to the one thing it is for, so it cannot be replayed as any other answer.
+const PROOF_LABEL: &[u8] = b"dudes-floor-daemon-proof-v1\n";
+
+/// HMAC-SHA-256 of the parts joined, for a 32-byte key only, which is shorter than a block.
+fn hmac_sha256_key32(key: &[u8; 32], parts: &[&[u8]]) -> [u8; 32] {
+    const BLOCK: usize = 64;
+    let mut inner_pad = [0x36_u8; BLOCK];
+    let mut outer_pad = [0x5c_u8; BLOCK];
+    for (index, byte) in key.iter().enumerate() {
+        inner_pad[index] ^= byte;
+        outer_pad[index] ^= byte;
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    for part in parts {
+        inner.update(part);
+    }
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner.finalize());
+    outer.finalize().into()
 }
 
 fn mint_secret() -> String {
@@ -1814,6 +1886,72 @@ mod tests {
             "the daemon now says the session is unknown"
         );
         assert!(kept.is_valid() && acts(&sessions, &staying));
+    }
+
+    #[test]
+    fn the_proof_is_the_keyed_hash_of_the_label_and_the_nonce() {
+        let key: [u8; 32] = std::array::from_fn(|index| u8::try_from(index).expect("small"));
+        let mac = hmac_sha256_key32(&key, &[PROOF_LABEL, "A".repeat(43).as_bytes()]);
+        assert_eq!(
+            base64url(&mac),
+            "vpd4EAoUA9QB6vPA9t7K-KS6G_0Tk36Kz5l6EoyaC5g"
+        );
+    }
+
+    #[test]
+    fn only_the_session_named_by_the_cookie_proves_and_only_while_it_lives() {
+        let (_clock, sessions) = probe_registry();
+        let first = probe_session(&sessions);
+        let second = probe_session(&sessions);
+        let nonce = "B".repeat(43);
+        let expected = |secret: &str| {
+            base64url(&hmac_sha256_key32(
+                &digest(secret.as_bytes()),
+                &[
+                    PROOF_LABEL,
+                    PROBE_ORIGIN.as_bytes(),
+                    b"\n",
+                    nonce.as_bytes(),
+                ],
+            ))
+        };
+
+        assert_eq!(
+            sessions.prove(Some(&first.cookie), &nonce),
+            expected(&first.csrf)
+        );
+        assert_eq!(
+            sessions.prove(Some(&second.cookie), &nonce),
+            expected(&second.csrf)
+        );
+        assert_ne!(
+            sessions.prove(Some(&second.cookie), &nonce),
+            expected(&first.csrf),
+            "the cookie names the session, not the secret"
+        );
+        for cookie in [None, Some("C".repeat(43))] {
+            let answer = sessions.prove(cookie.as_deref(), &nonce);
+            assert_eq!(answer.len(), 43, "same shape as a real answer");
+            assert_eq!(
+                answer,
+                sessions.prove(cookie.as_deref(), &nonce),
+                "asked twice, an absent session answers as a live one does"
+            );
+            assert_ne!(answer, expected(&first.csrf));
+            assert_ne!(answer, expected(&second.csrf));
+        }
+        assert!(
+            sessions
+                .0
+                .registry
+                .lock()
+                .end(&digest(first.cookie.as_bytes()))
+        );
+        assert_ne!(
+            sessions.prove(Some(&first.cookie), &nonce),
+            expected(&first.csrf),
+            "a session that ended no longer proves"
+        );
     }
 }
 
