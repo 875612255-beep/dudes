@@ -23,7 +23,7 @@ pub const DEFAULT_HOP_CAP: u32 = 5;
 pub const DEFAULT_PREDICATE_TIMEOUT_S: u64 = 600;
 /// The next step when the daemon has no enrolled project.
 pub const NO_PROJECT_HINT: &str =
-    "No project yet. In your project's folder run `dudes workspace add`.";
+    "No project yet. In your project's folder run `dudes project add`.";
 /// The name the guided first hire offers.
 const DEFAULT_NAME: &str = "Kim";
 
@@ -525,7 +525,7 @@ pub fn changed_check() -> Vec<String> {
 const CHANGED_LABEL: &str = "files changed";
 
 /// Said wherever [`changed_check`] is offered, so the default is never a surprise.
-const NO_TEST_CHECK: &str = "No test command was found here. The default check passes once the agent has edited or added a \
+pub(crate) const NO_TEST_CHECK: &str = "No test command was found here. The default check passes once the agent has edited or added a \
      file that is not committed yet. Dudes runs it itself, then you review the change.";
 
 /// The check a repository suggests, or [`changed_check`] after saying so when it names none.
@@ -538,7 +538,7 @@ fn default_check(term: &mut Terminal<'_>, dir: &Path) -> Result<Vec<String>, Sto
 }
 
 /// The Floor's label for a check: the plain words for [`changed_check`], else the command.
-fn check_label(argv: &[String]) -> String {
+pub(crate) fn check_label(argv: &[String]) -> String {
     if argv == changed_check() {
         CHANGED_LABEL.to_owned()
     } else {
@@ -597,7 +597,7 @@ fn workspace_step(
 ) -> Result<(), Stopped> {
     if let Some(id) = file.enrolled_at(cwd) {
         return Ok(term.say(&format!(
-            "\nWorkspace. {} is enrolled as {id}.",
+            "\nProject. {} is enrolled as {id}.",
             cwd.display()
         ))?);
     }
@@ -607,7 +607,7 @@ fn workspace_step(
         "the Floor can hire agents into it once floor.hire is on"
     };
     term.say(&format!(
-        "\nWorkspace. {} is a git repository. Enrolled, {hires}. A completion check is a command \
+        "\nProject. {} is a git repository. Enrolled, {hires}. A completion check is a command \
          the daemon runs itself to decide that a goal is done, typed as a program and its \
          arguments separated by spaces.",
         cwd.display()
@@ -702,9 +702,9 @@ fn hire_step(
     };
     if provider == Provider::Codex {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
-        term.say("Codex's command sandbox permits writes in this workspace, its permitted temporary directories and its own outgoing mailbox. The completion check runs this workspace's code with no sandbox.")?;
+        term.say("Codex's command sandbox permits writes in this project's folder, its permitted temporary directories and its own outgoing mailbox. The completion check runs this project's code with no sandbox.")?;
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        term.say("Codex's command sandbox permits writes in this workspace and its permitted temporary directories. Mail is unavailable on this platform. The completion check runs this workspace's code with no sandbox.")?;
+        term.say("Codex's command sandbox permits writes in this project's folder and its permitted temporary directories. Mail is unavailable on this platform. The completion check runs this project's code with no sandbox.")?;
     }
     plan.hire = Some(Hire {
         name: DEFAULT_NAME.to_owned(),

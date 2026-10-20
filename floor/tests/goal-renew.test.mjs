@@ -265,7 +265,7 @@ test('the renewal form states what a new goal gets, in the specified words, and 
   const lines = [...html.matchAll(/<(?:p|li)[^>]*>([^<]*)<\/(?:p|li)>/g)].map((match) => match[1]);
   assert.deepEqual(lines.slice(0, 7), [
     'This goal has no turns left.',
-    'A new goal gets this workspace’s allowance: 3 turns.',
+    'A new goal gets this project’s allowance: 3 turns.',
     'a cap of $1',
     'Daily ceilings still apply. If one is reached, the first turn waits for the next UTC day.',
     'Notes waiting for the current goal are not delivered to the new one.',
@@ -409,10 +409,10 @@ test('the response map reads renewed on the renewal and changed on the change, a
 test('the renewal outcomes read the specified words, and a 200 says only that the goal is recorded until the projection moves', async () => {
   const said = {
     goal_not_exhausted: 'This goal still has turns or dollars left, so nothing was recorded. Change its text instead.',
-    workspace_unavailable: 'This agent’s workspace is not enrolled at its directory now, or sets no ceiling that the '
+    workspace_unavailable: 'This agent’s project is not enrolled at its directory now, or sets no ceiling that the '
       + 'daemon’s billing key requires, so nothing was recorded. Give it a new goal from a terminal (dudes goal), '
       + 'or retire it and hire a new one.',
-    profile_changed: 'The workspace’s allowance or checks changed since this page read it, so nothing was '
+    profile_changed: 'The project’s allowance or checks changed since this page read it, so nothing was '
       + 'recorded. The floor is being refreshed.',
     stale_goal: 'This agent’s goal changed since this page read it, so nothing was recorded. '
       + 'The floor is being refreshed.',
@@ -463,7 +463,7 @@ test('profile_changed refreshes the snapshot, releases the form, and the next pr
 
 test('a goal_exhausted answer says to start a new goal only when one is offered, and otherwise keeps the terminal copy', async () => {
   const offeredCopy = 'This goal has no turns or capped dollars left to carry over, so nothing was recorded. '
-    + 'Start a new goal with this workspace’s allowance below.';
+    + 'Start a new goal with this project’s allowance below.';
   const terminalCopy = 'This goal has no turns or capped dollars left to carry over, so nothing was recorded. '
     + 'To continue, give the agent a new goal with its own limits from a terminal (dudes goal), '
     + 'or retire it and hire a new one.';

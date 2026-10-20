@@ -29,7 +29,7 @@ import type { FieldName, HireAttempt, HireDraft, HireOutcome, HireState } from '
 /** What each engine may touch, as the operator must read it before choosing. */
 const ENGINE_REACH: Readonly<Record<HireEngine, string>> = Object.freeze({
   claude: 'Runs with permission prompts skipped. It can change any file your account can.',
-  codex: "Codex's sandbox limits its own writes to this workspace. The completion check runs this workspace's code "
+  codex: "Codex's sandbox limits its own writes to this project. The completion check runs this project's code "
     + 'with no sandbox.',
   pi: 'Has no sandbox. It can change any file your account can.',
 });
@@ -91,7 +91,7 @@ function unavailable(floor: FloorState): string | null {
   if (floor.phase !== 'live' || floor.snapshotEpoch !== floor.epoch) return 'Waiting for a snapshot from the daemon.';
   if (floor.stale) return 'The view is unconfirmed, so Hire waits for the stream.';
   if (floor.onboarding === null) {
-    return 'The daemon offers no enrolled workspace to this session, so Hire is unavailable.';
+    return 'The daemon offers no project to this session, so Hire is unavailable.';
   }
   return null;
 }
@@ -250,7 +250,7 @@ function HireForm({ hire, floor, onClose }: {
           )}
           {hire.section !== 'engine' ? null : (
             <>
-              {workspace === null ? <p className="hire-note">Choose a workspace to see the engines it offers.</p> : (
+              {workspace === null ? <p className="hire-note">Choose a project to see the engines it offers.</p> : (
                 <fieldset className="hire-choices" aria-invalid={invalid('engine')} aria-describedby={described('engine')}>
                   <legend>Which app should do the work?</legend>
                   {workspace.engines.map((name) => (
@@ -264,7 +264,7 @@ function HireForm({ hire, floor, onClose }: {
                 </fieldset>
               )}
               {withdrawn ? <p className="hire-note">{"An engine missing here is turned off in the daemon's "
-                + 'configuration, or needs a ceiling on this workspace because the daemon holds a billing key for it.'}</p>
+                + 'configuration, or needs a ceiling on this project because the daemon holds a billing key for it.'}</p>
                 : null}
               {engine === null || row === null ? null : <p className="hire-note" data-engine-found={row.found}>
                 {row.found ? `${HIRE_ENGINES[engine]} is installed on this computer.`
@@ -370,7 +370,7 @@ function HireForm({ hire, floor, onClose }: {
 }
 
 function NoHireProjectHint() {
-  return <p className="hire-note">Agents work in a project, and none is set up yet. In your project&apos;s folder run <code>dudes workspace add</code>.</p>;
+  return <p className="hire-note">Agents work in a project, and none is set up yet. In your project&apos;s folder run <code>dudes project add</code>.</p>;
 }
 
 function HirePortrait({ draft }: { readonly draft: HireDraft }) {
@@ -443,7 +443,7 @@ function HireAnswer({ hire, floor }: { readonly hire: HireState; readonly floor:
       )}
       {!settled ? null : (
         <p className="hire-note">
-          {!fresh ? 'Another Hire is offered once a fresh snapshot lists an enrolled workspace.'
+          {!fresh ? 'Another Hire is offered once a fresh snapshot lists an project.'
             : floor.onboarding === null ? 'This session offers no further hires.'
               : 'The fresh snapshot offers another Hire.'}
         </p>
@@ -624,7 +624,7 @@ function AnswerBody({ outcome, hire, floor }: {
                 ? 'Hiring is no longer available to this session. The daemon refused before any effect: the '
                   + 'session may have used its four hires, or its enrollment is no longer eligible. No agent was hired.'
                 : !offered
-                  ? `The workspace ${workspace} is no longer offered. No agent was hired.`
+                  ? `The project ${workspace} is no longer offered. No agent was hired.`
                   : 'The daemon refused this Hire before any effect. No agent was hired.'}
         </p>
       );
@@ -639,8 +639,8 @@ function AnswerBody({ outcome, hire, floor }: {
     case 'stale':
       return (
         <p className="hire-error" role="alert">
-          A reload changed this workspace in the daemon&apos;s configuration after this page was offered it, so
-          the daemon refused this Hire before any effect. No agent was hired. Review the workspace in the fresh
+          A reload changed this project in the daemon&apos;s configuration after this page was offered it, so
+          the daemon refused this Hire before any effect. No agent was hired. Review the project in the fresh
           snapshot and hire again.
         </p>
       );

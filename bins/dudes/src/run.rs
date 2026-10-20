@@ -680,7 +680,7 @@ fn select_hire(
     let cwd = if let Some(id) = selected {
         if check.removed.contains(&id) || check.changed.iter().any(|changed| changed.id == id) {
             return Err(local(
-                "Project settings have changed. Run `dudes workspace reload` before hiring, or pass --cwd <project folder>.",
+                "Project settings have changed. Run `dudes project reload` before hiring, or pass --cwd <project folder>.",
             ));
         }
         workspace::directory(config, &id).map_err(local)?
@@ -1630,7 +1630,7 @@ fn enrollment(plan: &Plan, cwd: Option<&Path>) -> Result<Option<NewWorkspace>, F
     };
     let cwd = cwd.ok_or_else(|| local("the current directory cannot be read"))?;
     let name = cwd.file_name().map_or_else(
-        || "workspace".to_owned(),
+        || "project".to_owned(),
         |name| name.to_string_lossy().into_owned(),
     );
     let id: String = name
@@ -1645,7 +1645,7 @@ fn enrollment(plan: &Plan, cwd: Option<&Path>) -> Result<Option<NewWorkspace>, F
         .take(128)
         .collect();
     let id = if id.is_empty() {
-        "workspace".to_owned()
+        "project".to_owned()
     } else {
         id
     };
@@ -1677,7 +1677,7 @@ enum Comparison {
     Unknown(String),
     /// What it runs differently from this file, by `floor.enrollment.reload` and `system.doctor`.
     Known {
-        /// The SHA-256 of the bytes it read, which `dudes workspace reload --apply` takes.
+        /// The SHA-256 of the bytes it read, which `dudes project reload --apply` takes.
         sha256: String,
         /// Start-time settings it runs differently: each section the reload reports and each
         /// engine table `system.doctor` disagrees with. Each takes a restart.
@@ -1765,12 +1765,12 @@ fn running_differences(env: &Environment, config: &Path) -> Result<Comparison, F
     };
     let workspaces = [(&check.added, "added"), (&check.removed, "removed")]
         .into_iter()
-        .flat_map(|(ids, how)| ids.iter().map(move |id| format!("workspace {id} {how}")))
+        .flat_map(|(ids, how)| ids.iter().map(move |id| format!("project {id} {how}")))
         .chain(
             check
                 .changed
                 .iter()
-                .map(|entry| format!("workspace {} changed", entry.id)),
+                .map(|entry| format!("project {} changed", entry.id)),
         )
         .collect();
     let mut settings = check.not_applied;
@@ -1968,8 +1968,8 @@ fn no_goal_note(
         return match enrolled {
             None => hired,
             Some((id, _)) => format!(
-                "{hired}; the Floor offers workspace {id}'s check, which already passes, so add \
-                 one for the next goal there with dudes workspace check add {id} --id <id> \
+                "{hired}; the Floor offers project {id}'s check, which already passes, so add \
+                 one for the next goal there with dudes project check add {id} --id <id> \
                  --label <text> -- <program> [args...]"
             ),
         };
@@ -1981,9 +1981,9 @@ fn no_goal_note(
     match enrolled {
         None => hired,
         Some((id, config)) => format!(
-            "{hired}; workspace {id} is enrolled with the same check, so the Floor offers no hire \
-             there until you change its predicate_argv in {} and run dudes workspace reload, then \
-             dudes workspace reload --apply <sha256>",
+            "{hired}; project {id} is enrolled with the same check, so the Floor offers no hire \
+             there until you change its predicate_argv in {} and run dudes project reload, then \
+             dudes project reload --apply <sha256>",
             config.display()
         ),
     }
@@ -2090,7 +2090,22 @@ fn wire(command: &Command) -> Result<(Method, Option<Value>), Failure> {
     })
 }
 
-/// `dudes workspace`: edit the operator file, then have a running daemon adopt exactly that edit.
+/// What `project add` prints, with the files-changed note first when no check was named or found.
+fn write_enrolled(out: &mut dyn Write, new: &workspace::NewWorkspace) -> std::io::Result<()> {
+    if new.predicate_argv == setup::changed_check() {
+        writeln!(out, "{}", setup::NO_TEST_CHECK)?;
+    }
+    writeln!(
+        out,
+        "Enrolled project {} at {} with check {}. To change it, run `dudes project remove {}` and add it again with your options.",
+        render::Escaped(&new.id),
+        render::Escaped(&new.path.display().to_string()),
+        render::Escaped(&new.completion_check_label),
+        render::Escaped(&new.id)
+    )
+}
+
+/// `dudes project`: edit the operator file, then have a running daemon adopt exactly that edit.
 fn workspace_command(
     command: &WorkspaceCommand,
     env: &Environment,
@@ -2122,7 +2137,7 @@ fn workspace_command(
                 (out, err),
             )?;
             if status == exit::SUCCESS && !machine {
-                writeln!(out, "Enrolled project {} at {} with check {}. To change it, run `dudes workspace remove {}` and add it again with your options.", render::Escaped(&new.id), render::Escaped(&new.path.display().to_string()), render::Escaped(&new.completion_check_label), render::Escaped(&new.id))
+                write_enrolled(out, &new)
                     .map_err(|error| Failure::Other(Message::Local(error.to_string())))?;
             }
             Ok(status)
@@ -2300,8 +2315,8 @@ fn restart_advice(env: &Environment, config: &Path, out: &mut dyn Write) -> std:
     if !workspaces.is_empty() {
         writeln!(
             out,
-            "the running daemon has not adopted the file's workspace changes ({}); `dudes \
-             workspace reload --apply {}` adopts them without a restart",
+            "the running daemon has not adopted the file's project changes ({}); `dudes \
+             project reload --apply {}` adopts them without a restart",
             Escaped(&workspaces.join(", ")),
             Escaped(&sha256)
         )?;
@@ -2376,7 +2391,7 @@ fn adopt(
             let unknown = |message| {
                 format!(
                     "{message}; {} keeps this edit, and whether the daemon adopted it is \
-                     unknown: `dudes workspace reload` shows what differs",
+                     unknown: `dudes project reload` shows what differs",
                     config.display()
                 )
             };
@@ -3125,9 +3140,9 @@ mod no_goal_note_tests {
             ),
             "Kim is already hired, so running quickstart again would hire a second agent; give \
              Kim a goal with: dudes goal --agent 01ARZ3NDEKTSV4RRFFQ69G5FAV --text <text> \
-             --hop-cap 5 -- <program> [args...]; workspace repo is enrolled with the same check, \
+             --hop-cap 5 -- <program> [args...]; project repo is enrolled with the same check, \
              so the Floor offers no hire there until you change its predicate_argv in \
-             /home/operator/dudes.toml and run dudes workspace reload, then dudes workspace reload \
+             /home/operator/dudes.toml and run dudes project reload, then dudes project reload \
              --apply <sha256>"
         );
     }
@@ -3148,8 +3163,8 @@ mod no_goal_note_tests {
             "Kim is already hired, so running quickstart again would hire a second agent; give \
              Kim a goal whose check fails until the goal is met, with: dudes goal --agent \
              01ARZ3NDEKTSV4RRFFQ69G5FAV --text <text> --hop-cap 5 -- <program> [args...]; the \
-             Floor offers workspace repo's check, which already passes, so add one for the next \
-             goal there with dudes workspace check add repo --id <id> --label <text> -- <program> \
+             Floor offers project repo's check, which already passes, so add one for the next \
+             goal there with dudes project check add repo --id <id> --label <text> -- <program> \
              [args...]"
         );
     }

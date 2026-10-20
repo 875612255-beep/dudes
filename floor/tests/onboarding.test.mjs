@@ -25,7 +25,7 @@
 //   - the old `engine` key accepted ............. "unset ceilings decode as null…"
 //   - `provider` sent for every engine .......... "an uncapped Codex hire sends provider…"
 //   - an unset ceiling shown as $0 .............. "an unset ceiling reads No cap…"
-//   - the offered-engine comparison dropped ..... "a registered engine this workspace lacks…"
+//   - the offered-engine comparison dropped ..... "a registered engine this project lacks…"
 //   - the check fields left out of the body ..... "one Hire sends exactly seven fields…",
 //                                                  "the Hire body names the chosen check…"
 //   - a check refusal cleared like a stale one .. "each check refusal keeps the wizard open…"
@@ -480,7 +480,7 @@ test('an uncapped Codex hire sends provider, and a Claude hire leaves it out', a
   await hire.submitHire(getFloorState(), unsent);
   assert.equal(unsent.calls.length, 0, 'a Hire with no engine chosen was sent');
   assert.equal(hire.getHireState().section, 'engine');
-  assert.match(render(), /role="alert">Choose an engine this workspace offers\.</);
+  assert.match(render(), /role="alert">Choose an engine this project offers\.</);
   const radios = [...render().matchAll(/<input type="radio" name="engine" value="([^"]+)"/g)].map((match) => match[1]);
   assert.deepEqual(radios, ['claude', 'codex', 'pi']);
 
@@ -549,7 +549,7 @@ test('the Hire body names the chosen check by its id and the revision the snapsh
 });
 
 test('a workspace the checks sibling does not list cannot be hired, and says why', async () => {
-  const NO_CHECK = 'No completion check is offered for this workspace, so Hire is unavailable.';
+  const NO_CHECK = 'No completion check is offered for this project, so Hire is unavailable.';
   for (const checks of [{ workspaces: [CHECKS.workspaces[1]] }, null]) {
     resetFloorStore();
     hire.resetHire();
@@ -591,9 +591,9 @@ const CHECK_REFUSED = (reason) => (request) => ({ status: 409,
 
 /** What each check refusal says when the chosen check is "CONTRIBUTING.md exists". */
 const HIRE_REFUSALS = Object.freeze({
-  check_already_passes: '“CONTRIBUTING.md exists” already passes in this workspace, so it cannot show when this goal '
+  check_already_passes: '“CONTRIBUTING.md exists” already passes in this project, so it cannot show when this goal '
     + 'is done. Nothing was hired. Choose another check, or ask the operator to add one for this goal with dudes '
-    + 'workspace check add.',
+    + 'project check add.',
   check_did_not_finish: '“CONTRIBUTING.md exists” did not finish, so it cannot show whether it already passes. '
     + 'Nothing was hired. Try again, or ask the operator to raise its timeout.',
   check_cannot_run: '“CONTRIBUTING.md exists” could not run, so nothing was hired. The daemon log says why.',
@@ -684,8 +684,8 @@ test('the Engine step states what each offered engine can touch', () => {
     .map(([, engine, line]) => [engine, line]);
   assert.deepEqual(lines, [
     ['Claude', 'Runs with permission prompts skipped. It can change any file your account can.'],
-    ['Codex', 'Codex&#x27;s sandbox limits its own writes to this workspace. The completion check runs this '
-      + 'workspace&#x27;s code with no sandbox.'],
+    ['Codex', 'Codex&#x27;s sandbox limits its own writes to this project. The completion check runs this '
+      + 'project&#x27;s code with no sandbox.'],
     ['Pi', 'Has no sandbox. It can change any file your account can.'],
   ]);
 });
@@ -713,14 +713,14 @@ test('with no project the Workspace step gives one setup command and no jargon',
   subscribe({ onboarding: null, checks: null, settings: SETTINGS });
   hire.showSection('workspace');
   const html = render();
-  assert.match(html, /Agents work in a project, and none is set up yet\. In your project&#x27;s folder run <code>dudes workspace add<\/code>\./);
+  assert.match(html, /Agents work in a project, and none is set up yet\. In your project&#x27;s folder run <code>dudes project add<\/code>\./);
   assert.equal((html.match(/none is set up yet/g) ?? []).length, 1);
-  assert.doesNotMatch(html, /No enrolled workspace|operator enrolled|Hire needs a workspace|by its ID/);
+  assert.doesNotMatch(html, /No enrolled project|operator enrolled|Hire needs a project|by its ID/);
   assert.match(html, /class="hire-submit"[^>]*aria-disabled="true"/);
   hire.moveSection(1, getFloorState());
   const afterNext = render();
   assert.equal((afterNext.match(/none is set up yet/g) ?? []).length, 1);
-  assert.doesNotMatch(afterNext, /No enrolled workspace/);
+  assert.doesNotMatch(afterNext, /No enrolled project/);
   assert.equal(hire.getHireState().section, 'workspace');
 });
 
@@ -737,7 +737,7 @@ test('project setup guidance keeps a stale-stream reason visible', () => {
   noteStale(true);
   const html = render();
   assert.match(html, /The view is unconfirmed, so Hire waits for the stream\./);
-  assert.match(html, /Agents work in a project, and none is set up yet\. In your project&#x27;s folder run <code>dudes workspace add<\/code>\./);
+  assert.match(html, /Agents work in a project, and none is set up yet\. In your project&#x27;s folder run <code>dudes project add<\/code>\./);
 });
 
 test('project setup guidance keeps an explicit Hire-off command visible', () => {
@@ -747,12 +747,12 @@ test('project setup guidance keeps an explicit Hire-off command visible', () => 
   hire.showSection('workspace');
   const html = render();
   assert.match(html, /Hire is off\. Turn it on with dudes config set floor.hire on, then restart the daemon\./);
-  assert.match(html, /Agents work in a project, and none is set up yet\. In your project&#x27;s folder run <code>dudes workspace add<\/code>\./);
+  assert.match(html, /Agents work in a project, and none is set up yet\. In your project&#x27;s folder run <code>dudes project add<\/code>\./);
 });
 const WITHDRAWN = '<p class="hire-note">An engine missing here is turned off in the daemon&#x27;s configuration, or '
-  + 'needs a ceiling on this workspace because the daemon holds a billing key for it.</p>';
+  + 'needs a ceiling on this project because the daemon holds a billing key for it.</p>';
 
-test('a registered engine this workspace lacks is explained as configuration or a billing-key ceiling', () => {
+test('a registered engine this project lacks is explained as configuration or a billing-key ceiling', () => {
   for (const [providers, shown] of [[['claude', 'pi'], true], [['claude'], false], [['claude', 'grok'], false]]) {
     resetFloorStore();
     subscribe({ settings: { ...SETTINGS, providers } });
@@ -925,7 +925,7 @@ test('403 with a live snapshot says no longer available, not session expiry', as
   assert.doesNotMatch(html, /data-hire-agent-id/);
 
   resubscribe({ onboarding: { ...structuredClone(CATALOG), workspaces: [CATALOG.workspaces[1]] } });
-  assert.match(render(), /The workspace repo_1 is no longer offered/);
+  assert.match(render(), /The project repo_1 is no longer offered/);
 
   // A no-effect refusal lets the operator edit, keeping what was typed.
   hire.releaseAttempt();
@@ -1027,7 +1027,7 @@ test('a Hire sends the offered workspace revision, and a stale-workspace 409 dro
   assert.equal(hire.releasable(hire.getHireState()), true, 'refused before any effect, so the form comes back');
   const html = render();
   assert.doesNotMatch(html, SUCCESS);
-  assert.match(html, /class="hire-error" role="alert">A reload changed this workspace/);
+  assert.match(html, /class="hire-error" role="alert">A reload changed this project/);
 
   hire.releaseAttempt();
   const fresh = { ...MARKED, workspaces: [{ ...CATALOG.workspaces[0], reload_mark: { ...MARK, revision: '3' } },

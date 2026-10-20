@@ -651,8 +651,8 @@ test('an achieved goal starts with nothing chosen, and Send waits for a choice',
 
 /** What each check refusal of a goal change says, for a check named as `check`. */
 const GOAL_REFUSALS = (check) => ({
-  check_already_passes: `${check} already passes in this workspace, so it cannot show when this goal is done. `
-    + 'Nothing changed. Choose another check, or ask the operator to add one for this goal with dudes workspace '
+  check_already_passes: `${check} already passes in this project, so it cannot show when this goal is done. `
+    + 'Nothing changed. Choose another check, or ask the operator to add one for this goal with dudes project '
     + 'check add.',
   check_did_not_finish: `${check} did not finish, so it cannot show whether it already passes. Nothing changed. `
     + 'Try again, or ask the operator to raise its timeout.',
@@ -685,8 +685,8 @@ test('each check refusal reads as the Hire’s with Nothing changed, names the c
   }
 });
 
-test('an agent no enrolled workspace offers checks to can only keep its check, and an already-passing one says why', async () => {
-  const NOT_ENROLLED = 'This agent’s check already passes, and no enrolled workspace offers this agent another check. '
+test('an agent no enrolled project offers checks to can only keep its check, and an already-passing one says why', async () => {
+  const NOT_ENROLLED = 'This agent’s check already passes, and no enrolled project offers this agent another check. '
     + 'Nothing changed. Set a new goal from a terminal (dudes goal) with a check that fails until the goal is met.';
   subscribe({ agents: [enrolled({ workspace: { id: 'repo_9', label: 'Elsewhere' } })], checks: CHECKS });
   await change(daemon(REFUSED('check_already_passes')));
@@ -703,7 +703,7 @@ test('an agent no enrolled workspace offers checks to can only keep its check, a
 
 test('workspace_unavailable and profile_changed say nothing changed, and a changed check refreshes the floor', async () => {
   for (const [reason, text, refreshes] of [
-    ['workspace_unavailable', 'This agent’s workspace is no longer enrolled at its directory, so that check cannot be '
+    ['workspace_unavailable', 'This agent’s project is no longer enrolled at its directory, so that check cannot be '
       + 'chosen. Nothing changed.', 0],
     ['profile_changed', 'The operator changed that check after this page read it. Nothing changed. Choose again.', 1],
   ]) {
