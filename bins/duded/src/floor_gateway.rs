@@ -26,6 +26,7 @@ use sha2::{Digest as _, Sha256};
 
 use dudes_supervisor::Clock;
 
+use crate::engine_login::EngineLogins;
 use crate::floor_actions::{OnboardOutcome, OnboardRefusal, OnboardRequest};
 use crate::floor_answer::{AnswerOutcome, AnswerRefusal, AnswerRequest, MAX_ANSWER_BODY_BYTES};
 use crate::floor_chat::{ChatOutcome, ChatRefusal, ChatRequest, ChatVerb, MAX_CHAT_BODY_BYTES};
@@ -44,7 +45,7 @@ use crate::floor_project::{
 use crate::floor_rename::{MAX_RENAME_BODY_BYTES, RenameOutcome, RenameRefusal, RenameRequest};
 use crate::floor_retire::{MAX_RETIRE_BODY_BYTES, RetireOutcome, RetireRefusal, RetireRequest};
 use crate::floor_session::{
-    ActionKind, FloorSessionAuthorizer, FloorSessions, ReceiptSession, ReserveResult,
+    ActionKind, FloorSessionAuthorizer, FloorSessions, LoginSession, ReceiptSession, ReserveResult,
     SESSION_COOKIE_NAME, SessionIdentity, StreamSession, TerminalSession,
 };
 use crate::floor_settings_edit::{MAX_SETTINGS_BODY_BYTES, SettingsRefusal, SettingsRequest};
@@ -116,6 +117,8 @@ const SETTINGS_PATH: &str = "/floor/settings";
 const PROJECT_PREVIEW_PATH: &str = "/floor/project/preview";
 const PROJECT_ADD_PATH: &str = "/floor/project/add";
 const TERMINAL_PATH: &str = "/floor/terminal";
+/// Routed only while `[floor.hire]` is on: the socket that signs in to an engine.
+const ENGINE_LOGIN_PATH: &str = "/floor/engine-login";
 /// Routed only when the operator enabled the Git tab; otherwise a POST here is any
 /// unrouted POST.
 const GIT_PATH: &str = "/floor/git";
@@ -149,9 +152,9 @@ pub const JOIN_BOUND: Duration = Duration::from_secs(2);
 const FAULT_WAIT: Duration = Duration::from_secs(5);
 
 const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'";
-/// A terminal-enabled daemon admits inline styles for the terminal's renderer. Every
+/// A daemon that draws a terminal admits inline text in style elements for the renderer. Every
 /// other directive is byte-identical to [`CSP`].
-const TERMINAL_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self'; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'";
+const TERMINAL_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; style-src-elem 'self' 'unsafe-inline'; img-src 'self'; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'";
 
 const STARTING: u8 = 0;
 const READY: u8 = 1;
@@ -247,9 +250,8 @@ pub struct PreparedAssets {
     remembered: Option<u16>,
     /// Which routes exist right now. The loop thread swaps it when the operator file changes.
     switches: SharedSwitches,
-    /// Whether the daemon started with the terminal on, which decides the page's security policy
-    /// for the whole run.
-    terminal_csp: bool,
+    /// The engine sign-ins, served only while `[floor.hire]` is on.
+    logins: Option<EngineLogins>,
     /// The Git route's reader and limits, served only while `[floor.git]` is on.
     git: Option<Arc<GitReads>>,
     /// The diff route's reader, served only while `[floor.git]` and `[floor.diff]` are on.
@@ -514,8 +516,14 @@ impl PreparedAssets {
     /// Serve the routes that `switches` turns on, now and after every later swap.
     #[must_use]
     pub(crate) fn with_switches(mut self, switches: SharedSwitches) -> Self {
-        self.terminal_csp = switches.load().terminal;
         self.switches = switches;
+        self
+    }
+
+    /// Serve the engine sign-in socket over `logins` while `[floor.hire]` is on.
+    #[must_use]
+    pub(crate) fn with_engine_logins(mut self, logins: EngineLogins) -> Self {
+        self.logins = Some(logins);
         self
     }
 
@@ -674,9 +682,9 @@ impl PreparedAssets {
         let assets = Arc::new(self.assets);
         let manifest = Arc::new(self.manifest);
         let switches = self.switches;
-        let terminal_csp = self.terminal_csp;
         let git = self.git;
         let diff = self.diff;
+        let logins = self.logins;
         let board = self.board;
         let tickets = Some(Arc::clone(&board));
         let peer = self.peer;
@@ -703,9 +711,9 @@ impl PreparedAssets {
                             assets: &assets,
                             manifest: &manifest,
                             switches: &switches,
-                            terminal_csp,
                             git: git.as_deref(),
                             diff: diff.as_deref(),
+                            logins: logins.as_ref(),
                             board: &board,
                             memory: &memory,
                             peer: &peer,
@@ -1069,6 +1077,18 @@ fn handle_connection(
                             handle,
                         );
                     }
+                    SocketSession::Login(session) => {
+                        if let Some(logins) = catalog.engine_logins() {
+                            crate::engine_login::serve(
+                                &mut stream,
+                                &session,
+                                &buffered,
+                                phase,
+                                logins,
+                                catalog.switches,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1082,18 +1102,24 @@ struct Catalog<'a> {
     assets: &'a BTreeMap<String, Asset>,
     manifest: &'a [u8],
     switches: &'a SharedSwitches,
-    terminal_csp: bool,
     git: Option<&'a GitReads>,
     diff: Option<&'a DiffReads>,
+    logins: Option<&'a EngineLogins>,
     board: &'a TicketLimits,
     memory: &'a MemoryReads,
     peer: &'a PeerGate,
 }
 
 impl<'a> Catalog<'a> {
-    /// The terminal switch at start decides the page's policy, so one run stamps one CSP.
-    const fn csp(self) -> &'static str {
-        if self.terminal_csp { TERMINAL_CSP } else { CSP }
+    /// The page's policy follows the live switches: the terminal and the engine sign-in that hiring
+    /// carries both draw a terminal, which needs inline styles.
+    fn csp(self) -> &'static str {
+        let live = self.live();
+        if live.terminal || live.hire {
+            TERMINAL_CSP
+        } else {
+            CSP
+        }
     }
 
     /// The switches as they are now. A route reads this once per request.
@@ -1109,6 +1135,11 @@ impl<'a> Catalog<'a> {
     /// The diff reads while `[floor.git]` and `[floor.diff]` are on.
     fn diff(self) -> Option<&'a DiffReads> {
         self.diff.filter(|_| self.live().serves_diff())
+    }
+
+    /// The engine sign-ins while `[floor.hire]` is on.
+    fn engine_logins(self) -> Option<&'a EngineLogins> {
+        self.logins.filter(|_| self.live().hire)
     }
 
     /// The ticket limits while `[floor.board]` is on.
@@ -1220,6 +1251,7 @@ struct Upgrade {
 enum SocketSession {
     Stream(StreamSession),
     Terminal(TerminalSession),
+    Login(LoginSession),
 }
 
 impl SocketSession {
@@ -1227,6 +1259,7 @@ impl SocketSession {
         match self {
             Self::Stream(_) => SocketRoute::Stream,
             Self::Terminal(_) => SocketRoute::Terminal,
+            Self::Login(_) => SocketRoute::EngineLogin,
         }
     }
 
@@ -1234,6 +1267,7 @@ impl SocketSession {
         match self {
             Self::Stream(session) => session.is_valid(),
             Self::Terminal(session) => session.is_valid(),
+            Self::Login(session) => session.is_valid(),
         }
     }
 }
@@ -1242,6 +1276,7 @@ impl SocketSession {
 enum SocketRoute {
     Stream,
     Terminal,
+    EngineLogin,
 }
 
 impl SocketRoute {
@@ -1249,6 +1284,9 @@ impl SocketRoute {
         match (method, path) {
             ("GET", STREAM_PATH) => Some(Self::Stream),
             ("GET", TERMINAL_PATH) if catalog.live().terminal => Some(Self::Terminal),
+            ("GET", ENGINE_LOGIN_PATH) if catalog.engine_logins().is_some() => {
+                Some(Self::EngineLogin)
+            }
             _ => None,
         }
     }
@@ -1257,6 +1295,7 @@ impl SocketRoute {
         match self {
             Self::Stream => FLOOR_PROTOCOL,
             Self::Terminal => crate::floor_terminal::TERMINAL_PROTOCOL,
+            Self::EngineLogin => crate::engine_login::PROTOCOL,
         }
     }
 }
@@ -3231,7 +3270,7 @@ pub fn prepare(settings: &FloorSettings) -> Result<PreparedAssets> {
         port: settings.port,
         remembered: None,
         switches: SharedSwitches::default(),
-        terminal_csp: false,
+        logins: None,
         git: None,
         diff: None,
         board: Arc::new(TicketLimits::new()),
@@ -3528,9 +3567,9 @@ mod tests {
             assets,
             manifest,
             switches: &SWITCHES,
-            terminal_csp: false,
             git: None,
             diff: None,
+            logins: None,
             board: &BOARD,
             memory: &MEMORY,
             peer: open_gate(),

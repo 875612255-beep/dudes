@@ -28,6 +28,7 @@ use crate::floor_terminal::TerminalView;
 use crate::floor_websocket::{MAX_MESSAGE_BYTES, text_frame, text_payload};
 use crate::output::{Loss, OutputRegistry, OutputSnapshot, OutputState, ReplyLoss, Unavailable};
 use crate::provider_check::ProviderCheck;
+use crate::sign_in::SignInCheck;
 
 /// Accepted maximum queued messages on one Floor stream.
 pub const MAX_QUEUE_MESSAGES: usize = 256;
@@ -314,6 +315,8 @@ struct Inner {
     fault: FloorStreamFault,
     /// The `daemon` sibling's source, joined on the connection thread.
     daemon: Option<ProviderCheck>,
+    /// Whether each engine in the `daemon` sibling is signed in.
+    sign_in: Option<SignInCheck>,
     /// Woken by [`end_locked`], so a heartbeat thread parked between beats leaves at once rather
     /// than at its next tick. The `Weak` it also holds covers the other way a registry stops —
     /// being dropped with nobody calling `end` — but that one cannot be signalled, only noticed.
@@ -451,16 +454,18 @@ impl FloorStreams {
         fault: FloorStreamFault,
         output: Arc<OutputRegistry>,
         daemon: ProviderCheck,
+        sign_in: SignInCheck,
     ) -> Result<Self> {
-        Self::build(initial, fault, output, Some(daemon))
+        Self::build(initial, fault, output, Some((daemon, sign_in)))
     }
 
     fn build(
         initial: AgentSnapshot,
         fault: FloorStreamFault,
         output: Arc<OutputRegistry>,
-        daemon: Option<ProviderCheck>,
+        daemon: Option<(ProviderCheck, SignInCheck)>,
     ) -> Result<Self> {
+        let (daemon, sign_in) = daemon.unzip();
         let snapshot = serialize_snapshot(&initial)?;
         Ok(Self(Arc::new(Inner {
             state: Mutex::new(State {
@@ -476,6 +481,7 @@ impl FloorStreams {
             output,
             fault,
             daemon,
+            sign_in,
             ended: Condvar::new(),
         })))
     }
@@ -834,16 +840,35 @@ impl FloorStreams {
         {
             opened.snapshot = joined;
         }
+        let busy = self.busy_providers();
         if let Some(joined) = self
             .0
             .daemon
             .as_ref()
-            .and_then(ProviderCheck::sibling)
+            .and_then(|daemon| daemon.sibling(self.0.sign_in.as_ref(), &busy))
             .and_then(|daemon| with_sibling(&opened.snapshot, "daemon", &daemon))
         {
             opened.snapshot = joined;
         }
         Ok(opened)
+    }
+
+    /// The engines with an agent whose turn is running or whose keyboard a person holds, so a
+    /// status command stays away from their credentials.
+    fn busy_providers(&self) -> std::collections::BTreeSet<dudes_types::Provider> {
+        let state = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state
+            .current
+            .agents
+            .iter()
+            .filter(|agent| {
+                matches!(
+                    agent.status,
+                    dudes_types::AgentStatus::Running | dudes_types::AgentStatus::Attached
+                )
+            })
+            .map(|agent| agent.provider)
+            .collect()
     }
 
     fn join_settings(

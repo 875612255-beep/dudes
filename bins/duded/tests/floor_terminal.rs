@@ -42,7 +42,7 @@ const WAIT: Duration = Duration::from_secs(10);
 const QUIET: Duration = Duration::from_millis(300);
 const WIRE_BOUND_BYTES: usize = 8 * 1024 * 1024;
 const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'";
-const TERMINAL_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self'; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'";
+const TERMINAL_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; style-src-elem 'self' 'unsafe-inline'; img-src 'self'; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'";
 
 struct Floor {
     running: common::Running,
@@ -74,7 +74,19 @@ fn floor_reading(
     control: FloorControl,
     config: Option<PathBuf>,
 ) -> Floor {
+    floor_hiring(fixture, terminal, true, control, config)
+}
+
+/// [`floor_reading`] with `[floor.hire]` chosen, since hiring carries the engine sign-in terminal.
+fn floor_hiring(
+    fixture: &Fixture,
+    terminal: bool,
+    hire: bool,
+    control: FloorControl,
+    config: Option<PathBuf>,
+) -> Floor {
     let mut settings = fixture.settings();
+    settings.floor_hire_enabled = hire;
     settings.operator_config = config;
     settings.floor = Some(FloorSettings {
         assets_dir: PathBuf::from(FLOOR_FIXTURE),
@@ -1360,28 +1372,40 @@ fn detach_purges_old_output_before_the_boundary_and_a_new_grant_sees_only_its_pt
 #[test]
 fn terminal_csp_keeps_one_origin_and_exact_routes() {
     let fixture = Fixture::new();
-    let mut disabled = floor(&fixture, false);
+    let mut disabled = floor_hiring(&fixture, false, false, FloorControl::Off, None);
     assert_eq!(
         index_csp(&disabled),
         CSP,
-        "a disabled daemon keeps the default bytes"
+        "a daemon with neither a terminal nor hiring keeps the default bytes"
     );
     disabled.stop();
+
+    let fixture = Fixture::new();
+    let mut hiring = floor_hiring(&fixture, false, true, FloorControl::Off, None);
+    assert_eq!(
+        index_csp(&hiring),
+        TERMINAL_CSP,
+        "hiring draws the engine sign-in terminal, so it gets the terminal's policy"
+    );
+    hiring.stop();
 
     let fixture = Fixture::new();
     let mut floor = floor(&fixture, true);
     let (cookie, csrf) = session(&floor);
     let csp = index_csp(&floor);
     assert_eq!(csp, TERMINAL_CSP);
-    let differing: Vec<(&str, &str)> = csp
+    let default: Vec<&str> = CSP.split("; ").collect();
+    let without_elem: Vec<&str> = csp
         .split("; ")
-        .zip(CSP.split("; "))
-        .filter(|(enabled, default)| enabled != default)
+        .filter(|directive| !directive.starts_with("style-src-elem "))
         .collect();
     assert_eq!(
-        differing,
-        [("style-src 'self' 'unsafe-inline'", "style-src 'self'")],
-        "only style-src differs from the default"
+        without_elem, default,
+        "every default directive is kept, including the strict style-src for attributes"
+    );
+    assert!(
+        csp.contains("style-src-elem 'self' 'unsafe-inline'"),
+        "only style elements, which the renderer's stylesheet needs, take inline text"
     );
     let connect: Vec<&str> = csp
         .split(';')

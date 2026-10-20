@@ -80,6 +80,15 @@ pub trait PtyHostPort: Send {
     /// request and journals its confirmed outcome, and a retry hidden here would make "once" a
     /// property of nobody's code.
     fn write(&mut self, pty: PtyId, bytes: &[u8]) -> io::Result<usize>;
+    /// Write a few bytes of `bytes` if the terminal has room right now, and answer with the count,
+    /// `0` when it has none. It never waits for room.
+    ///
+    /// # Errors
+    /// The port does not own the handle, or cannot write without waiting.
+    fn write_ready(&mut self, pty: PtyId, bytes: &[u8]) -> io::Result<usize> {
+        let _ = (pty, bytes);
+        Err(io::ErrorKind::Unsupported.into())
+    }
     /// Change one live handle's character-cell size.
     fn resize(&mut self, pty: PtyId, cols: u16, rows: u16) -> io::Result<()>;
     /// Take the one subscription to a live handle's output.
@@ -119,6 +128,15 @@ pub trait PtyHostPort: Send {
     ) -> bool {
         let _ = (pty, identity);
         false
+    }
+    /// Whether one live handle's direct child has ended, and if so whether it exited 0. `None`
+    /// while it runs.
+    ///
+    /// # Errors
+    /// The port does not own the handle, or cannot ask.
+    fn exit_success(&mut self, pty: PtyId) -> io::Result<Option<bool>> {
+        let _ = pty;
+        Err(io::ErrorKind::Unsupported.into())
     }
     /// Attempt every session still retained by the host.
     fn shutdown(&mut self) -> io::Result<()>;
