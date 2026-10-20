@@ -2,6 +2,10 @@
 
 import { useSyncExternalStore } from 'react';
 
+import {
+  cancelSetting, changeSetting, confirmation, confirmSetting, editLine, getSettingsEditState, subscribeToSettingsEdit,
+} from './edit.ts';
+
 import type { FloorState } from '../floor/store.ts';
 import type { SettingsReport } from './report.ts';
 import { OFFICES } from '../office3d/offices.ts';
@@ -15,6 +19,7 @@ const SWITCHES = [
   ['answer', 'Answer questions'], ['control', 'Pause, resume and rename'], ['recovery', 'Recover interrupted goals'], ['goal', 'Change goals'],
   ['retire', 'Retire agents'], ['terminal', 'Attach terminals'], ['git', 'Read checkouts in the Git tab'],
   ['hire', 'Hire agents'], ['renew', 'Start new goals'],
+  ['board', 'Make tickets'], ['diff', 'Read ticket changes'], ['project', 'Add projects'],
 ] as const;
 const OFFICE_CHOICES = [{ id: null, label: 'Automatic' },
   ...OFFICES.map((office) => ({ id: office.id, label: `${office.definition.label}, ${office.capacity} desks` }))] as const;
@@ -72,7 +77,7 @@ export function SettingsView({ floor, onSetup }: {
       message="Settings are not reported by this daemon, or this page could not read them." /></div>;
   return <div className="settings-view">
     <DesktopNotificationChoice />
-    <p>The Floor only reads daemon settings. Run the commands locally to change them.</p>
+    <p>Turn a switch on or off here, or run its command locally. The budget numbers change only with the commands.</p>
     {floor.stale ? <p role="status">View unconfirmed. These values are from the last snapshot.</p> : null}
     <p>After a config edit, restart with <code>dudes quickstart --restart</code>, which ends any running turn.
       Project commands apply enrollment changes to the running daemon.</p>
@@ -82,6 +87,7 @@ export function SettingsView({ floor, onSetup }: {
         const next = report.switches[key] ? 'off' : 'on';
         const renewOff = report.switches.renew ? ' floor.renew off' : '';
         const companions = (key === 'goal' || key === 'retire' || key === 'recovery') && next === 'on' ? ' floor.control on'
+          : key === 'diff' && next === 'on' ? ' floor.git on'
           : key === 'control' && next === 'off' ? ` floor.goal off floor.retire off floor.recovery off${renewOff}`
             : (key === 'goal' || key === 'hire') && next === 'off' ? renewOff : '';
         if (key === 'renew' && !report.switches.renew) {
@@ -90,7 +96,8 @@ export function SettingsView({ floor, onSetup }: {
               It needs goal change and Hire.</dd></div>;
         }
         return <div key={key}><dt>{label} <code>floor.{key}</code></dt>
-          <dd>{report.switches[key] ? 'On' : 'Off'}<code>dudes config set floor.{key} {next}{companions}</code></dd></div>;
+          <dd>{key === 'diff' && report.switches.diff && !report.switches.git ? 'On, but needs Git' : report.switches[key] ? 'On' : 'Off'}<code>dudes config set floor.{key} {next}{companions}</code>
+            <SwitchButton switchKey={key} next={next} /></dd></div>;
       })}</dl>
       <p>Recovery needs both <code>floor.recovery</code> and <code>floor.control</code>. It keeps existing budgets and admission gates.
         Receipt lookup remains read-only when recovery is off.</p>
@@ -136,6 +143,21 @@ export function SettingsView({ floor, onSetup }: {
       <p>This page never checks for updates. To look for a newer version, run <code>dudes upgrade --check</code>.</p>
     </section>
   </div>;
+}
+
+/** Turns one switch on or off through the daemon, which keeps the file's start rules. */
+function SwitchButton({ switchKey, next }: { readonly switchKey: string; readonly next: 'on' | 'off' }) {
+  const edit = useSyncExternalStore(subscribeToSettingsEdit, getSettingsEditState, getSettingsEditState);
+  const key = `floor.${switchKey}`;
+  const question = edit.asking?.key === key ? confirmation(key, edit.asking.value) : null;
+  return <>
+    <button type="button" aria-disabled={edit.sending !== null || undefined}
+      onClick={() => { void changeSetting(key, next); }}>Turn {next}</button>
+    {question === null ? null : <span role="group" aria-label={`Turn ${next} ${key}`}> {question}
+      {' '}<button type="button" onClick={() => { void confirmSetting(); }}>Turn {next}</button>
+      {' '}<button type="button" onClick={() => cancelSetting()}>Cancel</button></span>}
+    {edit.last?.key === key ? <span role="status"> {editLine(edit.last.result)}</span> : null}
+  </>;
 }
 
 export function DesktopNotificationChoice() {

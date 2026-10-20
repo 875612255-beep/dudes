@@ -13785,7 +13785,7 @@ fn browser_settings_view_is_an_exact_read_only_allowlist() {
     assert_eq!(
         frame["settings"],
         json!({
-            "switches": { "answer": true, "hire": true, "control": true, "recovery": false, "goal": true, "renew": true, "retire": true, "terminal": true, "git": true },
+            "switches": { "answer": true, "hire": true, "control": true, "recovery": false, "goal": true, "renew": true, "retire": true, "terminal": true, "git": true, "board": false, "diff": false, "project": false },
             "budget": { "floor_usd_per_day_micros": "100000000", "per_turn_usd_micros": "1234", "per_turn_tokens": "9007199254740993" },
             "providers": ["claude"],
             "workspaces": [{ "workspace_id": "repo_1", "label": "Service workspace",
@@ -13833,7 +13833,7 @@ fn browser_settings_survive_unavailable_hire_and_provider_check() {
     assert_eq!(
         frame["settings"]["switches"],
         json!({
-            "answer": false, "hire": false, "control": false, "recovery": false, "goal": false, "renew": false,
+            "answer": false, "hire": false, "control": false, "recovery": false, "goal": false, "renew": false, "board": false, "diff": false, "project": false,
             "retire": false, "terminal": false, "git": false
         })
     );
@@ -17733,6 +17733,121 @@ fn a_reload_runs_a_floor_switch_without_a_restart() {
     assert_eq!(result["switches"], json!(["floor.answer"]), "{result}");
     let (answered, unrouted) = answer_route();
     assert_eq!(answered, unrouted, "off again is an unrouted path");
+    let (frame, _) = snapshot(addr, &cookie, &csrf);
+    assert!(frame.get("answer").is_none(), "{frame}");
+    assert_eq!(running.stop(ExitCause::ShutdownRpc), ExitCause::ShutdownRpc);
+}
+
+/// The Settings page edits the operator file through the daemon: a listed key is written and runs
+/// at once, a key outside the list is refused and the file is untouched, and an edit that breaks
+/// a start rule is refused whole.
+#[test]
+fn the_settings_route_writes_only_the_closed_list_of_keys() {
+    let fixture = Fixture::new();
+    let hire = "[floor.hire]\nenabled = true\n";
+    let mut settings = reload_settings(&fixture, hire);
+    settings.floor_answer_enabled = false;
+    settings.floor_hire_enabled = true;
+    let daemon = boot(
+        &settings,
+        seams(
+            &settings,
+            SharedHost::new(),
+            Arc::new(ScriptedRunner::default()),
+            Arc::new(TestClock::new()),
+            Witness::default(),
+        ),
+    )
+    .expect("boot Floor");
+    let addr = daemon.floor_addr().expect("Floor address");
+    let mut running = common::start(daemon);
+    let (cookie, csrf) = exchange(addr, &issue(&settings).bootstrap);
+    let file = settings.operator_config.clone().expect("a file");
+    let post = |key: &str, value: &str| {
+        let body = serde_json::to_vec(&json!({"key": key, "value": value})).expect("JSON");
+        post_bytes(addr, "/floor/settings", &cookie, &csrf, &body, None)
+    };
+
+    let (head, body) = post("floor.answer", "on");
+    assert!(head.starts_with("HTTP/1.1 200 OK"), "{head} {body}");
+    assert_eq!(body["applied"], json!(["floor.answer"]), "{body}");
+    assert!(
+        std::fs::read_to_string(&file)
+            .unwrap()
+            .contains("[floor.answer]")
+    );
+    let (frame, _) = snapshot(addr, &cookie, &csrf);
+    assert_eq!(frame["answer"], json!({ "max_text_bytes": 4096 }));
+
+    let before = std::fs::read(&file).unwrap();
+    for (key, value, reason) in [
+        ("providers.codex.streaming", "on", "key_not_editable"),
+        ("mcp.servers", "on", "key_not_editable"),
+        ("floor.answer", "maybe", "bad_value"),
+        ("floor.goal", "on", "start_rule"),
+    ] {
+        let (head, body) = post(key, value);
+        assert!(head.starts_with("HTTP/1.1 409 Conflict"), "{key}: {head}");
+        assert_eq!(body["reason"], reason, "{key}: {body}");
+        assert_eq!(std::fs::read(&file).unwrap(), before, "{key} wrote");
+    }
+    assert_eq!(running.stop(ExitCause::ShutdownRpc), ExitCause::ShutdownRpc);
+}
+
+/// A switch turned off from the Settings route refuses the very next action with `action_off`,
+/// without a restart.
+#[test]
+fn a_switch_turned_off_from_the_settings_route_refuses_the_next_action() {
+    let fixture = Fixture::new();
+    let mut settings = reload_settings(&fixture, "[floor.hire]\nenabled = true\n");
+    settings.floor_hire_enabled = true;
+    let (_, mut running, addr, cookie, csrf) = default_floor(&settings);
+    let (head, body) = post_onboard(addr, &cookie, &csrf, &hire_request('A', None));
+    assert_ne!(body["reason"], "action_off", "{head} {body}");
+
+    let off = serde_json::to_vec(&json!({"key": "floor.hire", "value": "off"})).expect("JSON");
+    let (head, body) = post_bytes(addr, "/floor/settings", &cookie, &csrf, &off, None);
+    assert!(head.starts_with("HTTP/1.1 200 OK"), "{head} {body}");
+    assert_eq!(body["applied"], json!(["floor.hire"]), "{body}");
+
+    let (head, body) = post_onboard(addr, &cookie, &csrf, &hire_request('B', None));
+    assert!(head.starts_with("HTTP/1.1 409 Conflict"), "{head}");
+    assert_eq!(body["reason"], "action_off", "{body}");
+    assert_eq!(browser_hires(&fixture), []);
+    assert_eq!(running.stop(ExitCause::ShutdownRpc), ExitCause::ShutdownRpc);
+}
+
+/// A saved edit the daemon could not adopt says so and never claims to run, and an edit that
+/// would zero a per-turn reserve is refused before anything is written.
+#[test]
+fn a_saved_edit_the_daemon_could_not_adopt_is_not_reported_as_running() {
+    let fixture = Fixture::new();
+    let mut settings = enrolled_settings(&fixture);
+    let file = fixture.state.path().join("config.toml");
+    std::fs::write(&file, "[budget.per_turn_floor]\nusd = 1\n").expect("operator file");
+    settings.operator_config = Some(file.clone());
+    let (_, mut running, addr, cookie, csrf) = default_floor(&settings);
+    let post = |key: &str, value: &str| {
+        let body = serde_json::to_vec(&json!({"key": key, "value": value})).expect("JSON");
+        post_bytes(addr, "/floor/settings", &cookie, &csrf, &body, None)
+    };
+
+    let before = std::fs::read(&file).unwrap();
+    let (head, body) = post("budget.per_turn_floor.usd", "0");
+    assert!(head.starts_with("HTTP/1.1 409 Conflict"), "{head}");
+    assert_eq!(body["reason"], "zeroes_reserve", "{body}");
+    assert_eq!(std::fs::read(&file).unwrap(), before, "a refusal wrote");
+
+    let (head, body) = post("floor.answer", "on");
+    assert!(head.starts_with("HTTP/1.1 200 OK"), "{head} {body}");
+    assert_eq!(body["state"], "saved_not_live", "{body}");
+    assert_eq!(body["reason"], "enrollment_drift", "{body}");
+    assert_eq!(body["applied"], json!([]), "{body}");
+    assert!(
+        std::fs::read_to_string(&file)
+            .unwrap()
+            .contains("[floor.answer]")
+    );
     let (frame, _) = snapshot(addr, &cookie, &csrf);
     assert!(frame.get("answer").is_none(), "{frame}");
     assert_eq!(running.stop(ExitCause::ShutdownRpc), ExitCause::ShutdownRpc);

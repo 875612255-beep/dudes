@@ -910,6 +910,8 @@ pub(crate) struct Ctx<H: ProcessHost, P: PredicateRunner, C: Clock> {
     pub(crate) running_mcp: dudes_providers::mcp::DeclaredServers,
     pub(crate) browser_launches: crate::chat_launch::LaunchPreparations,
     pub(crate) resolved_browser_turn: Option<(TurnId, u64)>,
+    /// The operator file the Settings page edits and a reload reads; `None` without one.
+    pub(crate) operator_config: Option<PathBuf>,
     /// Every `[floor.*]` switch as the last applied reload left it, shared with the gateway.
     pub(crate) switches: crate::floor_switches::SharedSwitches,
     /// Only attributed durable pauses and resumes populate this replayable request index.
@@ -1575,6 +1577,14 @@ impl<H: ProcessHost, P: PredicateRunner, C: Clock + Send + Sync, R: Rng> Daemon<
                     let answer = self.browser_retire(&session, &request);
                     let _ = reply.send(answer);
                 }
+                Job::SettingsEdit {
+                    session,
+                    request,
+                    reply,
+                } => {
+                    let answer = self.browser_settings_edit(&session, &request);
+                    let _ = reply.send(answer);
+                }
                 Job::Ticket {
                     session,
                     request,
@@ -2106,6 +2116,9 @@ impl<H: ProcessHost, P: PredicateRunner, C: Clock + Send + Sync, R: Rng> Daemon<
         switches.retire = live.control.retire();
         switches.terminal = self.ctx.browser_grants.is_some();
         switches.git = live.git;
+        switches.board = live.board;
+        switches.diff = live.diff;
+        switches.project = live.project;
         let settings = crate::floor_settings::view(
             switches,
             self.sup.config().floor_usd_per_day,
@@ -2221,6 +2234,88 @@ impl<H: ProcessHost, P: PredicateRunner, C: Clock + Send + Sync, R: Rng> Daemon<
             }
         }
         Ok(decision.result)
+    }
+
+    /// The Settings page's edit: the same `dudes_config` edit the CLI runs, then the reload the
+    /// CLI asks for, read here on the loop thread. A reload the daemon declines leaves the edit
+    /// saved for the next one.
+    fn browser_settings_edit(
+        &mut self,
+        session: &crate::floor_session::SessionIdentity,
+        request: &crate::floor_settings_edit::SettingsRequest,
+    ) -> Result<
+        crate::floor_settings_edit::SettingsSaved,
+        crate::floor_settings_edit::SettingsRefusal,
+    > {
+        use crate::floor_settings_edit::{NotLive, SettingsRefusal, SettingsSaved};
+        use dudes_config::config::ConfigError;
+        use sha2::Digest as _;
+        if !session.is_valid() {
+            return Err(SettingsRefusal::Forbidden);
+        }
+        let path = self
+            .ctx
+            .operator_config
+            .clone()
+            .ok_or(SettingsRefusal::NoFile)?;
+        let map = |error: ConfigError| match error {
+            ConfigError::Refused(_) | ConfigError::Holds { .. } => {
+                SettingsRefusal::StartRule(error.to_string())
+            }
+            _ => SettingsRefusal::FileError,
+        };
+        let mut draft = dudes_config::config::Draft::open(&path).map_err(map)?;
+        draft.apply(&request.change).map_err(map)?;
+        if draft.zeroes_a_reserve() {
+            return Err(SettingsRefusal::ZeroesReserve);
+        }
+        let edited = draft.write().map_err(map)?;
+        tracing::info!(
+            session = %&crate::enrollment_reload::hex(&session.digest().bytes())[..16],
+            change = %request.change,
+            wrote = edited.wrote,
+            "floor settings write"
+        );
+        let mut saved = SettingsSaved {
+            wrote: edited.wrote,
+            not_live: Some(NotLive::Unread),
+            ..SettingsSaved::default()
+        };
+        let Ok(bytes) = crate::config::read_operator_for_reload(&path) else {
+            return Ok(saved);
+        };
+        let sha256 = crate::enrollment_reload::hex(&sha2::Sha256::digest(
+            bytes.as_deref().unwrap_or_default(),
+        ));
+        let Ok((startup, memory_config)) =
+            crate::config::parse_operator_and_memory_with_options(&path, bytes.as_deref())
+        else {
+            return Ok(saved);
+        };
+        let read = crate::enrollment_reload::ReloadRead {
+            seq: self.ctx.reloads.local_seq(),
+            apply: Some(dudes_proto::rpc::floor::EnrollmentApply {
+                sha256: sha256.clone(),
+                added: Vec::new(),
+                removed: Vec::new(),
+                changed: Vec::new(),
+            }),
+            sha256,
+            path,
+            config: startup.operator,
+            memory_config,
+            pid: None,
+        };
+        if let Ok(result) = self.enrollment_reload(&read) {
+            saved.restart = result.not_applied;
+            if result.applied {
+                saved.applied = result.switches;
+                saved.not_live = None;
+            } else {
+                saved.not_live = Some(NotLive::Drifted);
+            }
+        }
+        Ok(saved)
     }
 
     /// Swap in the switches an applied reload read. Turning the terminal off revokes every live
@@ -6683,6 +6778,11 @@ impl<H: ProcessHost, P: PredicateRunner, C: Clock + Send + Sync, R: Rng> Daemon<
                 Job::FloorMemory { reply, .. } => drop(reply),
                 Job::Retire { reply, .. } => {
                     let _ = reply.send(Err(RetireRefusal::UnavailableNoEffect));
+                }
+                Job::SettingsEdit { reply, .. } => {
+                    let _ = reply.send(Err(
+                        crate::floor_settings_edit::SettingsRefusal::Unavailable,
+                    ));
                 }
                 Job::Ticket { reply, .. } => {
                     let _ = reply.send(crate::floor_ticket::TicketReply::Unavailable);
