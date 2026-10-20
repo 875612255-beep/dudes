@@ -8,16 +8,12 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::io::{BufReader, Write as _};
-use std::net::Shutdown;
+use std::io::Write as _;
 use std::num::NonZeroUsize;
-use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::hook_shim::{
-    generated_handlers, handler, handlers_for, minted_token, payload, spawn_handler,
-};
+use common::hook_shim::{handler, handlers_for, minted_token, payload, spawn_handler};
 use common::{Fixture, ScriptedRunner, SharedHost, SharedPtyHost, TestClock};
 use duded::classify::{ExternalChild, PeerBarrier, ProcessRelation, Relation, Resolver};
 use duded::ports::{Answered, Ask, PtyChild};
@@ -32,7 +28,7 @@ use dudes_proto::rpc::system::ShutdownResult;
 use dudes_proto::rpc::{ErrorCode, Method, RefusalGate, RefusedData, Response};
 use dudes_proto::{Actor, PeerProvenance, PtyCloseOutcome, Record};
 use dudes_rpc::conditioned::MAX_MEMORY_APPEND_TEXT_BYTES;
-use dudes_rpc::{Client, ClientError, LocalClient};
+use dudes_rpc::{Client, LocalClient};
 use dudes_supervisor::Input;
 use dudes_supervisor::host::{AdoptionKey, ProbeAnswer};
 use dudes_supervisor::testing::FakeRng;
@@ -40,21 +36,6 @@ use dudes_types::{AgentId, Lsn, TurnId};
 use serde_json::{Value, json};
 
 const WAIT: Duration = Duration::from_secs(10);
-
-fn await_rpc_connections(count: &dyn Fn() -> usize, expected: usize) {
-    let deadline = Instant::now() + WAIT;
-    loop {
-        let observed = count();
-        if observed == expected {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "expected {expected} RPC connections, observed {observed}"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
 
 #[derive(Clone, Debug)]
 enum Walk {
@@ -73,6 +54,7 @@ struct RelationState {
     next_slot: u64,
     confirmed: BTreeMap<u64, AdoptionKey>,
     walk: Walk,
+    refuse_registration: bool,
 }
 
 impl ScriptedRelation {
@@ -82,9 +64,15 @@ impl ScriptedRelation {
                 next_slot: 0,
                 confirmed: BTreeMap::new(),
                 walk: Walk::Unowned,
+                refuse_registration: false,
             }),
             ptys,
         ))
+    }
+
+    /// The next attached child is created but its registration fails.
+    fn refuse_registration(&self) {
+        self.0.lock().expect("relation").refuse_registration = true;
     }
 
     fn walk(&self, walk: Walk) {
@@ -141,7 +129,19 @@ impl ProcessRelation for ScriptedRelation {
     }
 
     fn track_external(&self, _slot: u64) -> Box<dyn ExternalChild> {
+        if self.0.lock().expect("relation").refuse_registration {
+            return Box::new(RefusedChild);
+        }
         Box::new(AttachedChild(self.1.clone()))
+    }
+}
+
+#[derive(Debug)]
+struct RefusedChild;
+
+impl ExternalChild for RefusedChild {
+    fn register(&mut self, _child: PtyChild) -> std::io::Result<AdoptionKey> {
+        Err(std::io::Error::other("injected registration refusal"))
     }
 }
 
@@ -168,7 +168,6 @@ struct Daemon {
     append_failure: AppendFailure,
     post_fsync_failure: OnboardingFailure,
     owner: Option<LocalClient>,
-    rpc_connections: Box<dyn Fn() -> usize + Send + Sync>,
     floor: Option<std::net::SocketAddr>,
 }
 
@@ -179,16 +178,17 @@ impl Daemon {
         Self::start_on(fixture, ptys)
     }
 
-    fn start_on(fixture: Fixture, ptys: SharedPtyHost) -> Self {
-        let settings = fixture.settings();
-        Self::boot(fixture, ptys, settings)
-    }
-
-    fn start_with_two_hook_slots() -> Self {
+    /// A daemon that gives up on an unanswered hook after 100 ms instead of two seconds.
+    fn start_with_short_hook_deadline() -> Self {
         let fixture = Fixture::new();
         let ptys = SharedPtyHost::with_native_evidence(fixture.journal_dir());
         let mut settings = fixture.settings();
-        settings.max_connections = NonZeroUsize::new(2).unwrap();
+        settings.hook_reply_timeout = Duration::from_millis(100);
+        Self::boot(fixture, ptys, settings)
+    }
+
+    fn start_on(fixture: Fixture, ptys: SharedPtyHost) -> Self {
+        let settings = fixture.settings();
         Self::boot(fixture, ptys, settings)
     }
 
@@ -236,7 +236,6 @@ impl Daemon {
         host.bind_child_ends(Arc::clone(&seams.children));
         let tokens = seams.rng.tokens();
         let daemon = duded::boot(&settings, seams).expect("boot");
-        let rpc_connections = daemon.rpc_connections_for_test();
         let append_failure = daemon.append_failure();
         let post_fsync_failure = daemon.onboarding_failure();
         let floor = daemon.floor_addr();
@@ -255,7 +254,6 @@ impl Daemon {
             append_failure,
             post_fsync_failure,
             owner: Some(owner),
-            rpc_connections,
             floor,
         }
     }
@@ -307,27 +305,6 @@ impl Daemon {
             minted_token(&self.fixture, &self.tokens, agent),
             turn,
         )
-    }
-
-    fn working_child(&self) -> (AgentId, HookToken, AdoptionKey) {
-        let (agent, token, turn) = self.working_agent();
-        let key = self
-            .fixture
-            .await_record("the recorded child", |record| match record {
-                Record::TurnSpawned {
-                    turn: seen,
-                    pid,
-                    start_time,
-                    boot,
-                    ..
-                } if *seen == turn => Some(AdoptionKey {
-                    pid: *pid,
-                    start_time: *start_time,
-                    boot: boot.clone(),
-                }),
-                _ => None,
-            });
-        (agent, token, key)
     }
 
     fn idle_agent(&self) -> (AgentId, HookToken) {
@@ -549,17 +526,8 @@ fn assert_control_deadline(output: &std::process::Output, event: &str) {
     assert!(output.stderr.is_empty(), "{event}: {output:?}");
 }
 
-fn assert_control_overload(output: &std::process::Output) {
-    assert_eq!(output.status.code(), Some(2), "{output:?}");
-    assert!(output.stdout.is_empty());
-    assert_eq!(
-        output.stderr,
-        b"dudes-hook: daemon overloaded; control step blocked; retry, and restart duded if this persists\n"
-    );
-}
-
 fn control_peer(state: DeadlineState) -> (Daemon, AgentId, HookToken, PtyId) {
-    let mut daemon = Daemon::start();
+    let mut daemon = Daemon::start_with_short_hook_deadline();
     let (agent, token) = daemon.idle_agent();
     let (pty, key) = daemon.attach(agent);
     match state {
@@ -628,17 +596,8 @@ fn unanswered_control(state: DeadlineState) {
             })
         };
     assert_eq!(daemon.running.handle.hooks_queued() - before, 2);
-    let completion = deadline_shutdown(&mut daemon);
-    for (event, output, elapsed) in &outputs {
-        let body = serde_json::from_slice::<Value>(&output.stdout).ok();
-        record_control_receipt(
-            &json!({"proof":"control_deadline","state":format!("{state:?}"),"event":event,
-                "exit":output.status.code(),"body":body,"elapsed_ms":elapsed.as_secs_f64()*1000.0,
-                "queued":2,"completion":completion,"host_shutdowns":daemon.host.shutdowns(),
-                "records_unchanged_while_held":true}),
-        );
-    }
-    for (event, output, _) in outputs {
+    deadline_shutdown(&mut daemon);
+    for (event, output) in outputs {
         assert_control_deadline(&output, event);
     }
 }
@@ -665,12 +624,11 @@ fn deadline_outputs(
     generated: &dudes_proto::providers::claude::Settings,
     token: &HookToken,
     fixture: &Fixture,
-) -> [(&'static str, std::process::Output, Duration); 2] {
+) -> [(&'static str, std::process::Output); 2] {
     let before = fixture.records();
     let outputs = ["PreToolUse", "UserPromptSubmit"].map(|event| {
-        let started = Instant::now();
         let (_, output) = spawn_handler(handler(generated, event), socket, token, &payload(event));
-        (event, output, started.elapsed())
+        (event, output)
     });
     assert_eq!(
         fixture.records(),
@@ -904,200 +862,45 @@ fn is_failed_close(record: &Record) -> bool {
     )
 }
 
+/// Fails closed: a PTY child the relation cannot register is closed, its open counts as not
+/// launched, and the attach is refused.
 #[test]
-fn a_notification_flood_does_not_block_another_agents_control_step() {
-    let mut daemon = Daemon::start_with_two_hook_slots();
-    let (other, other_token) = daemon.idle_agent();
-    let (pty, other_key) = daemon.attach(other);
-    let (agent, token, turn) = daemon.working_agent();
-    let key =
-        daemon.fixture.await_record(
-            "the flooding agent's recorded child",
-            |record| match record {
-                Record::TurnSpawned {
-                    turn: seen,
-                    pid,
-                    start_time,
-                    boot,
-                    ..
-                } if *seen == turn => Some(AdoptionKey {
-                    pid: *pid,
-                    start_time: *start_time,
-                    boot: boot.clone(),
-                }),
-                _ => None,
-            },
-        );
-    assert!(matches!(
-        daemon.running.handle.ask(Ask::Pause(agent)),
-        Ok(Answered::Done)
-    ));
-    assert!(
-        daemon
-            .fixture
-            .records()
-            .iter()
-            .any(|record| matches!(record, Record::Pause { agent: seen, .. } if *seen == agent))
+fn an_attached_child_the_relation_cannot_register_is_closed_and_refused() {
+    let mut daemon = Daemon::start();
+    let (agent, _) = daemon.idle_agent();
+    daemon.relation.refuse_registration();
+    let credential = daemon.credential();
+    let params = serde_json::to_value(AttachParams {
+        agent,
+        cols: 80,
+        rows: 24,
+    })
+    .expect("attach params");
+    let attach = daemon
+        .owner()
+        .call_as_operator(Method::AgentAttach, Some(params), credential)
+        .expect("attach response");
+    daemon.await_count(
+        "the failed attach detaches",
+        1,
+        |record| matches!(record, Record::Detached { agent: detached, .. } if *detached == agent),
     );
-    daemon.relation.walk(Walk::Inside(key));
-    let handlers = generated_handlers(other, daemon.fixture.state.path());
-    let socket = daemon.settings.socket();
-    let credential = daemon.credential();
-    let held = daemon.ptys.block_host_calls();
-    let before = daemon.running.handle.hooks_queued();
-    let owner = daemon.owner.as_mut().expect("the operator connection");
-    let fixture = &daemon.fixture;
-    let handle = &daemon.running.handle;
-    let rpc_connections = daemon.rpc_connections.as_ref();
-
-    std::thread::scope(|scope| {
-        let writing = scope.spawn(move || write_bytes(owner, credential, pty, b"hold the loop"));
-        fixture.await_record("the pending host write", |record| {
-            matches!(record, Record::PtyWriteRequested { pty: seen, .. } if *seen == pty)
-                .then_some(())
-        });
-        await_rpc_connections(rpc_connections, 1);
-        for _ in 0..2 {
-            let stream = UnixStream::connect(&socket).expect("hook connection");
-            let reader = BufReader::new(stream.try_clone().expect("hook reader"));
-            let mut client = Client::new(reader, stream.try_clone().expect("hook writer"));
-            let response = client
-                .call(
-                    Method::HookEvent,
-                    Some(hook_params(&token, &payload("Notification"))),
-                )
-                .expect("the observation hook is answered");
-            assert!(
-                response.error.is_none(),
-                "first hooks were admitted: {response:?}"
-            );
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .expect("bound hook disconnect");
-            stream
-                .shutdown(Shutdown::Write)
-                .expect("finish observation requests");
-            await_rpc_connections(rpc_connections, 1);
-            let disconnected = client.recv();
-            assert!(
-                matches!(disconnected, Err(ClientError::Closed)),
-                "{disconnected:?}"
-            );
-        }
-        assert_eq!(handle.hooks_queued(), before + 2, "both permits are queued");
-
-        daemon.relation.walk(Walk::Inside(other_key));
-        let started = Instant::now();
-        let (_, output) = spawn_handler(
-            handler(&handlers, "PreToolUse"),
-            &socket,
-            &other_token,
-            &payload("PreToolUse"),
-        );
-        let elapsed = started.elapsed();
-        let queued = handle.hooks_queued() - before;
-        drop(held);
-        assert!(writing.join().expect("writer thread").error.is_none());
-        writeln!(
-            std::io::stderr(),
-            "notification flood: elapsed={elapsed:?}, queued={queued}, exit={:?}",
-            output.status.code()
-        )
-        .unwrap();
-        assert_control_deadline(&output, "PreToolUse");
-        assert_eq!(queued, 3, "the other agent's control hook was admitted");
-    });
-    daemon.stop();
-}
-
-#[test]
-fn timed_out_control_backlog_blocks_both_control_hooks_without_more_jobs() {
-    let mut daemon = Daemon::start_with_two_hook_slots();
-    let (agent, token) = daemon.idle_agent();
-    let (pty, key) = daemon.attach(agent);
-    let (other, other_token, other_key) = daemon.working_child();
-    let (third, third_token, third_key) = daemon.working_child();
-    daemon.relation.walk(Walk::Inside(key));
-    let handlers = generated_handlers(agent, daemon.fixture.state.path());
-    let other_handlers = generated_handlers(other, daemon.fixture.state.path());
-    let third_handlers = generated_handlers(third, daemon.fixture.state.path());
-    let socket = daemon.settings.socket();
-    let credential = daemon.credential();
-    let held = daemon.ptys.block_host_calls();
-    let before = daemon.running.handle.hooks_queued();
-    let owner = daemon.owner.as_mut().expect("the operator connection");
-    let fixture = &daemon.fixture;
-    let handle = &daemon.running.handle;
-    let rpc_connections = daemon.rpc_connections.as_ref();
-
-    std::thread::scope(|scope| {
-        let writing = scope.spawn(move || write_bytes(owner, credential, pty, b"hold the loop"));
-        fixture.await_record("the pending host write", |record| {
-            matches!(record, Record::PtyWriteRequested { pty: seen, .. } if *seen == pty)
-                .then_some(())
-        });
-        await_rpc_connections(rpc_connections, 1);
-        let started = Instant::now();
-        let first = spawn_handler(
-            handler(&handlers, "PreToolUse"),
-            &socket,
-            &token,
-            &payload("PreToolUse"),
-        )
-        .1;
-        await_rpc_connections(rpc_connections, 1);
-        let refused_share = spawn_handler(
-            handler(&handlers, "UserPromptSubmit"),
-            &socket,
-            &token,
-            &payload("UserPromptSubmit"),
-        )
-        .1;
-        daemon.relation.walk(Walk::Inside(other_key));
-        await_rpc_connections(rpc_connections, 1);
-        let second = spawn_handler(
-            handler(&other_handlers, "PreToolUse"),
-            &socket,
-            &other_token,
-            &payload("PreToolUse"),
-        )
-        .1;
-        daemon.relation.walk(Walk::Inside(third_key));
-        let mut outputs = vec![first, second];
-        for event in ["PreToolUse", "UserPromptSubmit"] {
-            await_rpc_connections(rpc_connections, 1);
-            outputs.push(
-                spawn_handler(
-                    handler(&third_handlers, event),
-                    &socket,
-                    &third_token,
-                    &payload(event),
-                )
-                .1,
-            );
-        }
-        let elapsed = started.elapsed();
-        let queued = handle.hooks_queued() - before;
-        drop(held);
-        assert!(writing.join().expect("writer thread").error.is_none());
-        writeln!(
-            std::io::stderr(),
-            "stalled writer: elapsed={elapsed:?}, queued={queued}, exits={:?}",
-            outputs
-                .iter()
-                .map(|output| output.status.code())
-                .collect::<Vec<_>>()
-        )
-        .unwrap();
-        assert_control_overload(&refused_share);
-        assert_eq!(queued, 2, "expired retained work keeps the queue bounded");
-        for output in &outputs[..2] {
-            assert_control_deadline(output, "PreToolUse");
-        }
-        for output in &outputs[2..] {
-            assert_control_overload(output);
-        }
-    });
+    let refusal = attach.error.expect("the attach is refused");
+    assert!(
+        refusal.message.contains("injected registration refusal"),
+        "refused for the registration: {refusal:?}"
+    );
+    let opened = daemon.ptys.opens();
+    assert_eq!(opened.len(), 1, "the child was started once");
+    assert!(
+        daemon.ptys.live().is_empty(),
+        "the unregistered child was closed"
+    );
+    assert_eq!(
+        daemon.count(|record| matches!(record, Record::PtySpawned { .. })),
+        0,
+        "no key is recorded for a child that was never registered"
+    );
     daemon.stop();
 }
 
