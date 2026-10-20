@@ -360,6 +360,11 @@ impl duded::classify::ProcessRelation for HostPeerProcesses {
     fn track_external(&self, slot: u64) -> Box<dyn duded::classify::ExternalChild> {
         Box::new(HostExternalChild(self.0.track_external(slot)))
     }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn live_pids(&self) -> Vec<u32> {
+        self.0.live_pids()
+    }
 }
 
 /// The host relation's hold on one attached PTY child, behind the daemon's port.
@@ -1685,7 +1690,7 @@ fn settings_from_environment() -> anyhow::Result<(
             .map(|exe| exe.with_file_name(format!("dudes-hook{}", std::env::consts::EXE_SUFFIX))),
         daemon_exe: exe,
     };
-    let options = startup.options;
+    let options = startup.options.with_daemon_pid(Some(std::process::id()));
     #[cfg(feature = "fault-injection")]
     let options = options.with_recovery_stop(recovery_stop);
     Ok((settings, operator.providers, memory, options))
