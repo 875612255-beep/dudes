@@ -2172,6 +2172,10 @@ fn write_enrolled(out: &mut dyn Write, new: &workspace::NewWorkspace) -> std::io
 }
 
 /// `dudes project`: edit the operator file, then have a running daemon adopt exactly that edit.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per project subcommand, and each new subcommand adds its arm"
+)]
 fn workspace_command(
     command: &WorkspaceCommand,
     env: &Environment,
@@ -2245,6 +2249,8 @@ fn workspace_command(
             };
             finish_reload(env, config, machine, out, &result)
         }
+        WorkspaceCommand::Trust { id } => trust_command(env, id, true, machine, out),
+        WorkspaceCommand::Untrust { id } => trust_command(env, id, false, machine, out),
         WorkspaceCommand::CheckAdd(new) => {
             let edit = workspace::add_check(config, new).map_err(local)?;
             adopt(
@@ -2278,6 +2284,24 @@ fn workspace_command(
             Ok(exit::SUCCESS)
         }
     }
+}
+
+/// `dudes project trust` and `untrust`: the operator's grant, journaled by the daemon.
+fn trust_command(
+    env: &Environment,
+    id: &str,
+    trusted: bool,
+    machine: bool,
+    out: &mut dyn Write,
+) -> Result<u8, Failure> {
+    let result = typed::<dudes_proto::rpc::workspace::TrustResult>(operator_call(
+        env,
+        Method::WorkspaceTrust,
+        Some(serde_json::json!({ "workspace_id": id, "trusted": trusted })),
+    )?)?;
+    render::trust_set(out, machine, id, &result)
+        .map_err(|error| Failure::Other(Message::Local(error.to_string())))?;
+    Ok(exit::SUCCESS)
 }
 
 /// The operator file both `workspace` and `config` edit.

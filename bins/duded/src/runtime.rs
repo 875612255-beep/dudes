@@ -1472,6 +1472,17 @@ impl<H: ProcessHost, P: PredicateRunner, C: Clock + Send + Sync, R: Rng> Daemon<
                     let next = self.onboard_checked(&session, &request, baseline, run);
                     self.onboard_next(next, session, request, reply);
                 }
+                Job::OnboardCopied {
+                    session,
+                    request,
+                    baseline,
+                    worktree,
+                    trust,
+                    reply,
+                } => {
+                    let next = self.onboard_copied(&session, &request, baseline, worktree, &trust);
+                    self.onboard_next(next, session, request, reply);
+                }
                 Job::OnboardContinue {
                     session,
                     request,
@@ -2109,6 +2120,10 @@ impl<H: ProcessHost, P: PredicateRunner, C: Clock + Send + Sync, R: Rng> Daemon<
                 .filter(|profile| self.onboarding_profile_eligible(profile))
                 .map(|profile| (profile, self.offered_engines(profile)))
                 .filter(|(_, engines)| !engines.is_empty())
+                .map(|(profile, engines)| {
+                    let trusted = self.sup.world().workspace_trust.contains_key(&profile.id);
+                    (profile, engines, trusted)
+                })
                 .collect()
         } else {
             Vec::new()
@@ -2227,6 +2242,7 @@ impl<H: ProcessHost, P: PredicateRunner, C: Clock + Send + Sync, R: Rng> Daemon<
         }
         if decision.result.applied {
             self.ctx.enrollment = decision.candidate;
+            self.revoke_stale_grants();
             self.install_switches(decision.switches);
             match decision.resync {
                 Resync::None => {}
@@ -2548,6 +2564,7 @@ impl<H: ProcessHost, P: PredicateRunner, C: Clock + Send + Sync, R: Rng> Daemon<
                 &profile,
                 &check,
                 CheckBaseline::MayAlreadyPass,
+                None,
             );
         }
         let Predicate::Command { argv, timeout_s } = check.predicate.clone() else {
@@ -2596,10 +2613,80 @@ impl<H: ProcessHost, P: PredicateRunner, C: Clock + Send + Sync, R: Rng> Daemon<
         }
         match self.onboarding_admission(session, request) {
             Ok((profile, check)) => {
-                self.hire_onboarded(session, request, &profile, &check, baseline)
+                self.hire_onboarded(session, request, &profile, &check, baseline, None)
             }
             Err(refusal) => OnboardNext::Reply(OnboardStep::Answer(Err(refusal))),
         }
+    }
+
+    /// What a hire into its own copy needs before anything is made: a Claude agent on a platform
+    /// that makes copies, in a project the operator trusts. The agent then works in the copy and
+    /// not in the project's folder, so the shared-folder check is made on the copy later.
+    fn own_copy_admission(
+        &self,
+        request: &OnboardRequest,
+        profile: &Profile,
+    ) -> Result<(), OnboardRefusal> {
+        use crate::floor_actions::CopyRefusal;
+        if request.provider != Provider::Claude {
+            return Err(OnboardRefusal::OwnCopy(CopyRefusal::Engine));
+        }
+        if cfg!(windows) {
+            return Err(OnboardRefusal::OwnCopy(CopyRefusal::Platform));
+        }
+        if !self.sup.world().workspace_trust.contains_key(&profile.id) {
+            return Err(OnboardRefusal::OwnCopy(CopyRefusal::NotTrusted(
+                profile.id.clone(),
+            )));
+        }
+        Ok(())
+    }
+
+    /// The copy a new hire asks for, as the params the shared worktree path takes, with the
+    /// grant it rests on. The browser sends no trust: the operator's grant is read from the journal.
+    fn copy_step(
+        &self,
+        request: &OnboardRequest,
+        profile: &Profile,
+        baseline: dudes_proto::CheckBaseline,
+    ) -> OnboardNext {
+        use crate::floor_actions::CopyRefusal;
+        let refuse =
+            |why| OnboardNext::Reply(OnboardStep::Answer(Err(OnboardRefusal::OwnCopy(why))));
+        let Some(grant) = self.sup.world().workspace_trust.get(&profile.id) else {
+            return refuse(CopyRefusal::NotTrusted(profile.id.clone()));
+        };
+        let ticket = crate::worktree::hire::TrustTicket {
+            workspace_id: profile.id.clone(),
+            lsn: grant.lsn,
+            vouch: crate::worktree::trust::Vouch {
+                repository: grant.repository.clone(),
+                pin: grant.pin.clone(),
+            },
+        };
+        let params = HireParams {
+            name: request.name.clone(),
+            character: request.character,
+            accent: request.accent,
+            role: request.role.clone(),
+            department: profile.department.clone(),
+            provider: request.provider,
+            cwd: profile.cwd.clone(),
+            budget: profile.agent_budget,
+            sandbox: None,
+            isolation: browser_isolation(request.provider, profile),
+            max_turns: None,
+            max_budget: None,
+            trusted: true,
+            checkout: Some(dudes_proto::rpc::agent::Checkout::Worktree),
+            from: None,
+            mcp_servers: Vec::new(),
+        };
+        OnboardNext::Reply(OnboardStep::Copy {
+            params: Box::new(params),
+            baseline,
+            trust: Box::new(ticket),
+        })
     }
 
     /// The validation of a new hire, with the check it names: enrolled for the
@@ -2632,16 +2719,20 @@ impl<H: ProcessHost, P: PredicateRunner, C: Clock + Send + Sync, R: Rng> Daemon<
         if self.refuse_overlap(&profile.cwd, None).is_err() {
             return Err(OnboardRefusal::Forbidden);
         }
-        self.ctx
-            .admit_shared_folder(
-                &self.sup,
-                None,
-                request.provider,
-                browser_isolation(request.provider, &profile),
-                dudes_types::Mode::Managed,
-                &profile.cwd,
-            )
-            .map_err(OnboardRefusal::SharedFolder)?;
+        if request.own_copy {
+            self.own_copy_admission(request, &profile)?;
+        } else {
+            self.ctx
+                .admit_shared_folder(
+                    &self.sup,
+                    None,
+                    request.provider,
+                    browser_isolation(request.provider, &profile),
+                    dudes_types::Mode::Managed,
+                    &profile.cwd,
+                )
+                .map_err(OnboardRefusal::SharedFolder)?;
+        }
         let (id, revision) = request.check.as_ref().ok_or(OnboardRefusal::InvalidInput)?;
         let check = profile
             .check(id)
@@ -2656,7 +2747,8 @@ impl<H: ProcessHost, P: PredicateRunner, C: Clock + Send + Sync, R: Rng> Daemon<
     }
 
     /// Append one admitted browser hire whose intended goal carries its check and what the
-    /// check's run saw, then hand the reply on to the goal's append.
+    /// check's run saw, then hand the reply on to the goal's append. A hire that asks for its own
+    /// copy first answers with the copy to make; `copy` is that copy once it exists.
     fn hire_onboarded(
         &mut self,
         session: &crate::floor_session::SessionIdentity,
@@ -2664,13 +2756,21 @@ impl<H: ProcessHost, P: PredicateRunner, C: Clock + Send + Sync, R: Rng> Daemon<
         profile: &Profile,
         check: &crate::floor_actions::EnrolledCheck,
         baseline: CheckBaseline,
+        copy: Option<(crate::worktree::hire::LeaseView, dudes_types::Lsn)>,
     ) -> OnboardNext {
+        if request.own_copy && copy.is_none() {
+            return self.copy_step(request, profile, baseline);
+        }
         // Seal before the hire command can reach the supervisor, as `LoopControl::hire` does. A
         // browser first hire ends the pre-agent epoch exactly as a local one: a connection that
         // acquires after this point, an escaped agent child included, gets no operator effect
         // authority. Irreversible, so no permit, persistence or
         // spawn failure below reopens it.
         self.operator_authority.seal();
+        let (cwd, worktree, trust_lsn) = match copy {
+            Some((lease, lsn)) => (lease.path, Some(lease.worktree), Some(lsn)),
+            None => (profile.cwd.clone(), None, None),
+        };
         match self.pump_onboarding(
             session,
             Command::BrowserOnboardHire(Box::new(BrowserOnboardHire {
@@ -2680,7 +2780,7 @@ impl<H: ProcessHost, P: PredicateRunner, C: Clock + Send + Sync, R: Rng> Daemon<
                 role: request.role.clone(),
                 department: profile.department.clone(),
                 provider: request.provider,
-                cwd: profile.cwd.clone(),
+                cwd,
                 budget: profile.agent_budget,
                 isolation: browser_isolation(request.provider, profile),
                 goal_text: request.goal_text.clone(),
@@ -2694,11 +2794,77 @@ impl<H: ProcessHost, P: PredicateRunner, C: Clock + Send + Sync, R: Rng> Daemon<
                 profile_id: profile.id.clone(),
                 workspace_label: profile.label.clone(),
                 session_digest: session.digest(),
+                worktree,
+                trust_lsn,
             })),
         ) {
             Ok(()) => OnboardNext::Goal,
             Err(refusal) => OnboardNext::Reply(OnboardStep::Answer(Err(refusal))),
         }
+    }
+
+    /// A browser hire into its own copy once the copy exists: the admission again, the grant it
+    /// rests on checked again, the shared-folder check on the copy, then the hire into it.
+    fn onboard_copied(
+        &mut self,
+        session: &crate::floor_session::SessionIdentity,
+        request: &OnboardRequest,
+        baseline: CheckBaseline,
+        worktree: dudes_types::WorktreeId,
+        trust: &crate::worktree::hire::TrustTicket,
+    ) -> OnboardNext {
+        use crate::floor_actions::CopyRefusal;
+        let answer = |answer| OnboardNext::Reply(OnboardStep::Answer(answer));
+        if !self.ctx.switches.load().hire {
+            return answer(Err(OnboardRefusal::Check(ACTION_OFF)));
+        }
+        if self.exited || self.ctx.journal_writes_stopped() {
+            return answer(Err(OnboardRefusal::UnavailableNoEffect));
+        }
+        if self
+            .ctx
+            .onboarding_index
+            .attempt(request.attempt_id)
+            .is_some()
+        {
+            return answer(Err(OnboardRefusal::Unavailable));
+        }
+        let (profile, check) = match self.onboarding_admission(session, request) {
+            Ok(admitted) => admitted,
+            Err(refusal) => return answer(Err(refusal)),
+        };
+        let Some(lease) = self.pending_lease(worktree) else {
+            return answer(Err(OnboardRefusal::OwnCopy(CopyRefusal::Failed)));
+        };
+        if self
+            .trust_still_holds(Some(trust), &lease.origin, &profile.cwd)
+            .is_err()
+        {
+            return answer(Err(OnboardRefusal::OwnCopy(CopyRefusal::TrustChanged(
+                profile.id.clone(),
+            ))));
+        }
+        if self.refuse_overlap(&lease.path, Some(worktree)).is_err() {
+            return answer(Err(OnboardRefusal::Forbidden));
+        }
+        if let Err(refusal) = self.ctx.admit_shared_folder(
+            &self.sup,
+            None,
+            request.provider,
+            browser_isolation(request.provider, &profile),
+            dudes_types::Mode::Managed,
+            &lease.path,
+        ) {
+            return answer(Err(OnboardRefusal::SharedFolder(refusal)));
+        }
+        self.hire_onboarded(
+            session,
+            request,
+            &profile,
+            &check,
+            baseline,
+            Some((lease, trust.lsn)),
+        )
     }
 
     /// The initial goal's append for a hire the index holds.
@@ -2762,7 +2928,7 @@ impl<H: ProcessHost, P: PredicateRunner, C: Clock + Send + Sync, R: Rng> Daemon<
         let Some(profile) = self.ctx.enrollment.profile(&request.workspace_id) else {
             return partial("profile_changed");
         };
-        if !Self::recorded_profile_matches(attempt, profile, request.provider) {
+        if !self.recorded_profile_matches(attempt, profile, request.provider) {
             return partial("profile_changed");
         }
         if !self.ctx.switches.load().hire
@@ -2841,6 +3007,7 @@ impl<H: ProcessHost, P: PredicateRunner, C: Clock + Send + Sync, R: Rng> Daemon<
     /// Whether `profile` still holds every effective value the durable hire recorded, the chosen
     /// `engine` included.
     fn recorded_profile_matches(
+        &self,
         attempt: &crate::floor_actions::Attempt,
         profile: &Profile,
         engine: Provider,
@@ -2851,15 +3018,23 @@ impl<H: ProcessHost, P: PredicateRunner, C: Clock + Send + Sync, R: Rng> Daemon<
             cwd,
             budget,
             isolation,
+            worktree,
             ..
         } = &attempt.hire
         else {
             return false;
         };
+        // A hire into its own copy works in the tree, which must still be a copy of this project.
+        let folder = match worktree {
+            None => *cwd == profile.cwd,
+            Some(lease) => self.sup.world().worktrees.get(lease).is_some_and(|row| {
+                row.path == *cwd && crate::worktree::contains(&row.origin, &profile.cwd)
+            }),
+        };
         *provider == engine
             && attempt.metadata.profile_id == profile.id
             && *department == profile.department
-            && *cwd == profile.cwd
+            && folder
             && *budget == profile.agent_budget
             && *isolation == browser_isolation(engine, profile)
             && Self::recorded_check_enrolled(&attempt.metadata.intended_goal, profile)
@@ -4734,9 +4909,11 @@ impl<H: ProcessHost, P: PredicateRunner, C: Clock + Send + Sync, R: Rng> Daemon<
                 origin,
                 base,
                 from,
+                trust,
             } => {
                 self.worktree_admission(&params)?;
                 self.refuse_overlap(&origin, None)?;
+                self.trust_still_holds(trust.as_deref(), &origin, &params.cwd)?;
                 if let Some(from) = from {
                     let same =
                         self.sup.world().worktrees.get(&from).is_some_and(|row| {
@@ -4884,6 +5061,49 @@ impl<H: ProcessHost, P: PredicateRunner, C: Clock + Send + Sync, R: Rng> Daemon<
                     how: dudes_proto::WorktreeRemoval::Operator,
                 }))?;
                 Ok(Answered::Done)
+            }
+            Ask::TrustTarget(workspace_id) => match self.ctx.enrollment.profile(&workspace_id) {
+                Some(profile) => Ok(Answered::TrustTarget(profile.cwd.clone())),
+                None => Err(error(
+                    ErrorCode::InvalidParams,
+                    format!("workspace.trust: no enrolled project is named `{workspace_id}`"),
+                )),
+            },
+            Ask::TrustSet {
+                workspace_id,
+                directory,
+                vouch,
+            } => {
+                let Some((vouch, directory)) = vouch.zip(directory) else {
+                    // A revocation with no grant appends nothing, so removing a project that was
+                    // never trusted does not put a required record in anyone's journal.
+                    if !self.sup.world().workspace_trust.contains_key(&workspace_id) {
+                        return Ok(Answered::TrustSet(false));
+                    }
+                    self.revoke_grant(workspace_id)?;
+                    return Ok(Answered::TrustSet(true));
+                };
+                let enrolled = self
+                    .ctx
+                    .enrollment
+                    .profile(&workspace_id)
+                    .is_some_and(|profile| profile.cwd == directory);
+                if !enrolled {
+                    return Err(error(
+                        ErrorCode::Refused,
+                        format!(
+                            "workspace.trust: `{workspace_id}` is no longer enrolled at the \
+                             directory that was read; run the command again"
+                        ),
+                    ));
+                }
+                self.pump_or_refuse(Input::Command(Command::SetWorkspaceTrust {
+                    workspace_id,
+                    trusted: true,
+                    repository: Some(vouch.repository),
+                    pin: Some(vouch.pin),
+                }))?;
+                Ok(Answered::TrustSet(true))
             }
             Ask::WorktreePending => {
                 let world = self.sup.world();
@@ -6718,6 +6938,69 @@ impl<H: ProcessHost, P: PredicateRunner, C: Clock + Send + Sync, R: Rng> Daemon<
         }
     }
 
+    /// Append the revocation of the grant for `workspace_id`.
+    fn revoke_grant(&mut self, workspace_id: String) -> Result<(), RpcError> {
+        self.pump_or_refuse(Input::Command(Command::SetWorkspaceTrust {
+            workspace_id,
+            trusted: false,
+            repository: None,
+            pin: None,
+        }))
+    }
+
+    /// Revoke every grant whose project is no longer enrolled, or is enrolled somewhere that is not
+    /// inside the repository that was vouched for. Run in the loop step that replaces the
+    /// enrollment, so a removed project cannot come back trusted. Appends only where a grant exists.
+    fn revoke_stale_grants(&mut self) {
+        let stale: Vec<String> = self
+            .sup
+            .world()
+            .workspace_trust
+            .iter()
+            .filter(|(id, grant)| {
+                self.ctx.enrollment.profile(id).is_none_or(|profile| {
+                    !crate::worktree::contains(&grant.repository.directory, &profile.cwd)
+                })
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in stale {
+            if let Err(error) = self.revoke_grant(id.clone()) {
+                tracing::warn!(project = %id, %error.message, "could not revoke a trust grant");
+            }
+        }
+    }
+
+    /// A copy for the Floor rests on one grant. It holds only while that grant is still the
+    /// project's latest, so an untrust or a new grant between steps ends the hire, and only while
+    /// `origin` is still the directory the grant vouched for, by path and by identity.
+    fn trust_still_holds(
+        &self,
+        ticket: Option<&crate::worktree::hire::TrustTicket>,
+        origin: &std::path::Path,
+        project: &std::path::Path,
+    ) -> Result<(), RpcError> {
+        let Some(ticket) = ticket else {
+            return Ok(());
+        };
+        let holds = self
+            .sup
+            .world()
+            .workspace_trust
+            .get(&ticket.workspace_id)
+            .is_some_and(|grant| {
+                grant.lsn == ticket.lsn
+                    && crate::worktree::trust::still_there(&grant.repository, origin, project)
+            });
+        if holds {
+            Ok(())
+        } else {
+            Err(crate::worktree::unavailable(
+                crate::worktree::hire::TRUST_CHANGED,
+            ))
+        }
+    }
+
     fn pending_lease(
         &self,
         worktree: dudes_types::WorktreeId,
@@ -6771,6 +7054,7 @@ impl<H: ProcessHost, P: PredicateRunner, C: Clock + Send + Sync, R: Rng> Daemon<
                 }
                 Job::Onboard { reply, .. }
                 | Job::OnboardChecked { reply, .. }
+                | Job::OnboardCopied { reply, .. }
                 | Job::OnboardContinue { reply, .. } => {
                     let _ = reply.send(OnboardStep::Answer(Err(OnboardRefusal::Unavailable)));
                 }
