@@ -475,12 +475,12 @@ fn it_adds_a_launcher_that_runs_dudes_open() {
         };
         let text = std::fs::read_to_string(&launcher).expect("the launcher was written");
         assert!(text.contains(&expected), "{system}: {text}");
-        let marker = if system == "Darwin" {
+        let marker_line = if system == "Darwin" {
             "<key>DudesLauncher</key><true/>"
         } else {
             "X-Dudes-Launcher=1"
         };
-        let marked = if system == "Darwin" {
+        let launcher_body = if system == "Darwin" {
             std::fs::read_to_string(
                 host.home
                     .path()
@@ -491,7 +491,7 @@ fn it_adds_a_launcher_that_runs_dudes_open() {
             text.clone()
         };
         assert!(
-            marked.lines().any(|line| line.trim() == marker),
+            launcher_body.lines().any(|line| line.trim() == marker_line),
             "{system}: the marker line"
         );
         assert!(
