@@ -72,8 +72,9 @@ dudes uninstall
   that leaves it empty; anything else stays, and it says what. It never deletes the filesystem
   root, your home directory, a parent of it, or a symbolic link. With `DUDES_CONFIG` set it deletes
   only that file, and only if it reads as an operator file.
-- **The launcher.** It deletes the launcher `install.sh` wrote, found by the word `DudesLauncher`
-  inside it. A file or app of the same name that does not carry that word is yours, and stays.
+- **The launcher.** It deletes the launcher `install.sh` wrote, found by an exact marker
+  line inside it (`X-Dudes-Launcher=1` in the desktop entry). A file or app of the same name that does
+  not carry that line is yours, and stays.
 - **Programs.** It deletes `duded`, `dudes` and `dudes-hook` only when this copy was put there by
   `install.sh`. For a source build, `cargo install` or a link, it removes the data, leaves the
   programs and prints the commands to remove them by hand.

@@ -475,6 +475,25 @@ fn it_adds_a_launcher_that_runs_dudes_open() {
         };
         let text = std::fs::read_to_string(&launcher).expect("the launcher was written");
         assert!(text.contains(&expected), "{system}: {text}");
+        let marker = if system == "Darwin" {
+            "<key>DudesLauncher</key><true/>"
+        } else {
+            "X-Dudes-Launcher=1"
+        };
+        let marked = if system == "Darwin" {
+            std::fs::read_to_string(
+                host.home
+                    .path()
+                    .join("Applications/Dudes.app/Contents/Info.plist"),
+            )
+            .expect("the plist")
+        } else {
+            text.clone()
+        };
+        assert!(
+            marked.lines().any(|line| line.trim() == marker),
+            "{system}: the marker line"
+        );
         assert!(
             stdout(&installed).contains("the Dudes launcher in "),
             "{system}"

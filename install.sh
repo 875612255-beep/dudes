@@ -200,8 +200,8 @@ valid_rollback() {
 
 # Add a "Dudes" launcher that runs `dudes open`: an app in ~/Applications on macOS, a desktop entry
 # on Linux. It registers no URL scheme and no file type, so nothing outside the user's own menu can
-# start it. Both carry the word DudesLauncher, which `dudes uninstall` looks for before it deletes
-# one. A launcher that cannot be written never fails the install.
+# start it. Each carries a marker line, `X-Dudes-Launcher=1` or `<key>DudesLauncher</key><true/>`,
+# which `dudes uninstall` looks for before it deletes one. A launcher that cannot be written never fails the install.
 add_launcher() {
 	[ -n "${HOME:-}" ] || return 0
 	program=$bin/dudes
@@ -248,7 +248,7 @@ Comment=Open the Dudes Floor
 Exec="$program" open
 Terminal=false
 Categories=Development;
-X-DudesLauncher=true
+X-Dudes-Launcher=1
 EOF
 		} 2>/dev/null || return 0
 		launcher=$applications/dudes.desktop
