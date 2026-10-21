@@ -21,7 +21,7 @@ import { HireEntry, hireSwitchOn } from './renderer/onboarding/HireEntry';
 import { FirstRunGuide } from './renderer/setup/FirstRunGuide';
 import { FirstTask } from './renderer/setup/FirstTask.tsx';
 import {
-  agentToReveal, getHireState, markRevealed, prepareArchiveHire, prepareHire, subscribeToHire,
+  agentToReveal, getHireState, leaveHire, markRevealed, prepareArchiveHire, prepareHire, subscribeToHire,
 } from './renderer/onboarding/hire';
 import type { RetiredAgentRow } from './renderer/archive';
 import { AGENT_DETAIL_HEADING_ID, closesDrawer, focusAnswer, handFocusOnLeave, restoreFocusAfterDialog } from './renderer/focus';
@@ -294,6 +294,7 @@ function SignedInShell() {
 
   function closeHire(revealed = false): void {
     backdropPress.current = null;
+    leaveHire();
     hireDialog.current?.close();
     setHiring(false);
     const ticketDialog = document.getElementById('selected-card-detail');
@@ -414,7 +415,8 @@ function SignedInShell() {
         {crewOpen && !focused ? <CrewList agents={floor.agents} cards={floor.cards} selectedId={currentSelectedId}
           selectable={selectable} stale={floor.stale} onSelectAgent={selectAgent}
           onOpenCard={openCard}
-          addAgent={<HireEntry floor={floor} id="hire-open-crew" onAddAgent={openHire} folded />} /> : null}
+          addAgent={floor.agents.length === 0 && hireSwitchOn(floor) ? null
+            : <HireEntry floor={floor} id="hire-open-crew" onAddAgent={openHire} folded />} /> : null}
         {view === null || focused ? null : <Control key={view} floor={floor} view={view} selectedId={currentSelectedId}
           onClose={() => setView(null)} onView={openView} onOpenQuestion={openQuestion} onOpenTicket={openCard}
           onReviewRecovery={reviewRecovery} onHire={openHire} onHireAgain={hireAgain}
